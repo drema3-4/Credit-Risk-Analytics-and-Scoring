@@ -12,7 +12,9 @@ dependencies = [
     "seaborn (>=0.13.2,<0.14.0)",
     "ipykernel (>=7.3.0,<8.0.0)",
     "jupyter (>=1.1.1,<2.0.0)",
-    "statsmodels (>=0.14.6,<0.15.0)"
+    "statsmodels (>=0.14.6,<0.15.0)",
+    "scipy (>=1.18.0,<2.0.0)",
+    "dataframe-image (>=0.2.7,<0.3.0)"
 ]
 
 
