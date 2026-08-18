@@ -1,6 +1,6 @@
 .venv/
 __pycache__/
 repo_dump.txt
-borrowers.db
+raw_data.db
 temp.py
 temp.ipynb

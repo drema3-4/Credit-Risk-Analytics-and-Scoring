@@ -16,7 +16,9 @@ dependencies = [
     "seaborn (>=0.13.2,<0.14.0)",
     "ipykernel (>=7.3.0,<8.0.0)",
     "jupyter (>=1.1.1,<2.0.0)",
-    "statsmodels (>=0.14.6,<0.15.0)"
+    "statsmodels (>=0.14.6,<0.15.0)",
+    "scipy (>=1.18.0,<2.0.0)",
+    "dataframe-image (>=0.2.7,<0.3.0)"
 ]
 
 
@@ -68,11 +70,21 @@ README.md
 src\main.py
 ============================================================
 
-from scripts.prepare_dataset_after_data_quality_analysis import prepare_dataset_after_data_quality_analysis
+from scripts.prepare_analytical_dataset import (
+    prepare_analytical_dataset,
+)
+from scripts.make_raw_data_db import (
+    make_raw_data_db
+)
 
 
-# подготовка датасета после анализа качества данных
-prepare_dataset_after_data_quality_analysis()
+def main() -> None:
+    prepare_analytical_dataset()
+    make_raw_data_db()
+
+
+if __name__ == "__main__":
+    main()
 
 ============================================================
 src\notebooks\01_data_quality.ipynb
@@ -164,7 +176,7 @@ def make_z_test(
 Загрузка датасета.
 
 --- code cell ---
-data = pd.read_csv("../data/cs-training.csv")
+data = pd.read_csv("../data/raw/cs-training.csv")
 data = data.drop(columns=["Unnamed: 0"])
 
 --- code cell ---
@@ -447,7 +459,7 @@ duplicate_bad_rate
 
 --- code cell ---
 ci_low_duplicate_bad_rate, ci_high_duplicate_bad_rate = proportion_confint(
-    count=data[data.duplicated]["target"].sum(),
+    count=data[data.duplicated()]["target"].sum(),
     nobs=data[data.duplicated()].shape[0],
     alpha=0.05,
     method="wilson"
@@ -1374,13 +1386,2823 @@ quality_resume.style.set_properties(**{"text-align": "left", "white-space": "pre
 
 
 ============================================================
+src\notebooks\02_risk_analysis.ipynb
+============================================================
+
+--- markdown cell ---
+# Импорт библиотек и настройка среды
+
+--- code cell ---
+import pandas as pd
+from statsmodels.stats.proportion import proportion_confint
+import numpy as np
+from scipy.stats import chi2_contingency
+import matplotlib.pyplot as plt
+import seaborn as sns
+import dataframe_image as dfi
+from pathlib import Path
+
+--- code cell ---
+pd.set_option("display.max_columns", 100)
+pd.set_option('display.max_colwidth', None)
+pd.set_option("display.max_rows", 200)
+pd.set_option("display.float_format", lambda x: f"{x:,.4f}")
+
+--- markdown cell ---
+# Удобства для навигации
+
+--- code cell ---
+navigation = dict()
+
+--- markdown cell ---
+# Вспомогательные функции и схемы
+
+--- markdown cell ---
+## Функция для создания сегментов
+
+--- code cell ---
+def make_segments_continuos_feature(
+    data: pd.DataFrame,
+    feature: str,
+    special_values: list[float] = []
+) -> list[float]:
+    mask = data[feature].isin(special_values)
+    feature = data.loc[~mask, feature]
+
+    super_segments = np.unique(
+        np.quantile(
+            a=feature,
+            q=[0.0, 0.005, 0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 0.995, 1.0]
+        )
+    ).tolist()
+
+    segments = []
+    for i in range(len(super_segments)-1):
+        left = super_segments[i]
+        right = super_segments[i+1]
+
+        mask = (left <= feature) & (feature <= right)
+
+        segments.extend(
+            np.quantile(
+                a=feature[mask],
+                q=np.linspace(0, 1, 4)
+            ).tolist()
+        )
+
+    segments = list(
+        map(
+            lambda x: round(x, 2),
+            segments
+        )
+    )
+    segments.extend([min(feature), max(feature)])
+    segments = sorted(
+        np.unique(segments).tolist()
+    )
+    
+    return segments
+
+--- code cell ---
+def make_values(
+    data: pd.DataFrame,
+    feature: str,
+    special_values: list[float] = [],
+    segments: list[float] = []
+) -> list[float]:
+    mask = data[feature].isin(special_values + segments)
+    feature = data.loc[~mask, feature]
+
+    values = sorted(feature.unique().tolist())
+    
+    return values
+
+--- markdown cell ---
+## Функция для создания labels по сегментам
+
+--- code cell ---
+def make_labels(
+    segments: list[float]
+) -> list[str]:
+    labels = []
+    
+    for i in range(len(segments) - 1):
+        left = segments[i]
+        right = segments[i + 1]
+
+        if i == 0:
+            labels.append(f"[{left}, {right}]")
+        else:
+            labels.append(f"({left}, {right}]")
+
+    return labels
+
+--- markdown cell ---
+## Функция для создания столбца маркеров сегментов
+
+--- code cell ---
+def make_segment_col_continuos_feature(
+    data: pd.DataFrame,
+    feature: str,
+    segment_col_name: str,
+    segments: list[float],
+    special_values: list[float] = []
+) -> list[str]:
+    labels = make_labels(segments)
+
+    data[segment_col_name] = pd.cut(
+        x=data[feature],
+        bins=segments,
+        labels=labels,
+        right=True,
+        include_lowest=True
+    )
+
+
+    special_labels = []
+    if special_values:
+        for special_value in special_values:
+            if pd.isna(special_value):
+                label = "NaN"
+            else:
+                label = str(special_value)
+
+            special_labels.append(label)
+
+        new_categories = [
+            label
+            for label in special_labels
+            if label not in data[segment_col_name].cat.categories
+        ]
+
+        data[segment_col_name] = (
+            data[segment_col_name]
+            .cat.add_categories(new_categories)
+        )
+
+        for special_value in special_values:
+            if pd.isna(special_value):
+                mask = data[feature].isna()
+                label = "NaN"
+            else:
+                mask = data[feature].eq(special_value)
+                label = str(special_value)
+
+            data.loc[mask, segment_col_name] = label
+    
+
+    return labels + special_labels
+
+--- code cell ---
+def make_segment_col_count_or_cat_feature(
+    data: pd.DataFrame,
+    feature: str,
+    segment_col_name: str,
+    values: list[float],
+    segments: list[float] = [],
+    special_values: list[float] = []
+) -> list[str]:
+    values_ = values
+    if segments:
+        values_ = [value for value in values if value not in set(range(segments[0], segments[-1]+1))]
+    
+    values_labels = list(map(str, values_))
+    for value, value_label in zip(values_, values_labels):
+        mask = data[feature].eq(value)
+        data.loc[mask, segment_col_name] = value_label
+
+    data[segment_col_name] = data[segment_col_name].astype("category")
+
+    segments_labels = []
+    if segments:
+        segments_labels = make_labels(segments)
+
+        new_categories = [
+            label
+            for label in segments_labels
+        ]
+        data[segment_col_name] = (
+            data[segment_col_name]
+            .cat.add_categories(new_categories)
+        )
+
+        mask = data[feature].isin(values_)
+        data.loc[~mask, segment_col_name] = pd.cut(
+            x=data.loc[~mask, feature],
+            bins=segments,
+            labels=segments_labels,
+            right=True,
+            include_lowest=True
+        ).astype(object)
+
+    special_values_labels = []
+    if special_values:
+        special_values_labels = [
+            "Nan" if pd.isna(special_value) else str(special_value)
+            for special_value in special_values
+        ]
+
+        new_categories = [
+            label
+            for label in special_values_labels
+        ]
+
+        data[segment_col_name] = (
+            data[segment_col_name]
+            .cat.add_categories(new_categories)
+        )        
+
+        for special_value in special_values:
+            if pd.isna(special_value):
+                mask = data[feature].isna()
+                label = "Nan"
+            else:
+                mask = data[feature].eq(special_value)
+                label = str(special_value)
+
+            data.loc[mask, segment_col_name] = label
+    
+
+    return values_labels + segments_labels + special_values_labels
+
+--- markdown cell ---
+## Функция для соствления аналитического отчёта по признаку
+
+--- code cell ---
+COLUMNS_SEGMENT_REPORT = [
+    "segment",
+    "clients",
+    "dataset_share",
+    "dataset_bad_rate",
+    "bad_count",
+    "bad_share",
+    "bad_rate",
+    "ci_low",
+    "ci_high",
+    "delta_bad_rate_pp",
+    "lift"
+]
+
+--- code cell ---
+def make_segment_report_continuos_feature(
+    data: pd.DataFrame,
+    feature: str,
+    segments: list[float],
+    special_values: list[float] = [],
+    target_feature: str = "target",
+    out_path: str = ""
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Возвращает датасет с столбцом меток сегментов и таблицу отчёта сегментного анализа.
+
+    Args:
+        data: датасет.
+        feature: наименование признака, сегментация которого будет оцениваться.
+        segments: список границ сегментов, на который будет разбиваться признак.
+        special_values: специальные значения, под которые нужно выделить сегменты.
+        target_feature: наименования целевой переменной.
+        out_path: путь, по которому нужно сохранить таблицу, если он отсутствует, то сохранения не происходит.
+
+    Returns:
+        Возвращает датасет с столбцом меток сегментов и таблицу отчёта сегментного анализа.
+    """
+    df = data.copy(deep=True)
+
+    segment_col_name = f"{feature}_segments"
+
+    df_size = df.shape[0] * 1.0
+    df_bad_count = df[target_feature].sum()
+    df_bad_rate = df[target_feature].mean()    
+
+    segment_report = pd.DataFrame(columns=COLUMNS_SEGMENT_REPORT)
+
+    labels = make_segment_col_continuos_feature(
+        data=df,
+        feature=feature,
+        segment_col_name=segment_col_name,
+        segments=segments,
+        special_values=special_values
+    )
+
+    for label in labels:
+        segment = df.loc[
+            df[segment_col_name] == label
+        ]
+
+        clients = segment.shape[0]
+        dataset_share = clients / df_size
+        bad_count = segment[target_feature].sum()
+        bad_rate = segment[target_feature].mean()
+        ci_low, ci_high = proportion_confint(
+            count=bad_count,
+            nobs=clients,
+            alpha=0.05,
+            method="wilson"
+        )
+        delta_bad_rate_pp = round((bad_rate - df_bad_rate) * 100, 4)
+        lift = round(bad_rate / df_bad_rate, 4)
+        bad_share = round(bad_count / df_bad_count, 4)
+
+        segment_report.loc[ segment_report.shape[0] ] = [
+            label,
+            clients,
+            dataset_share,
+            df_bad_rate,
+            bad_count,
+            bad_share,
+            bad_rate,
+            ci_low,
+            ci_high,
+            delta_bad_rate_pp,
+            lift
+        ]
+
+    if out_path:
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        dfi.export(segment_report, out_path, table_conversion="matplotlib")
+
+    return (df, segment_report)
+
+--- code cell ---
+navigation["функция для соствления аналитического отчёта по непрерывному признаку"] =\
+    "make_segment_report_continuos_feature"
+
+--- code cell ---
+def make_segment_report_count_or_cat_feature(
+    data: pd.DataFrame,
+    feature: str,
+    special_values: list[float] = [],
+    segments: list[float] = [],
+    target_feature: str = "target",
+    out_path: str = ""
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Возвращает датасет с столбцом меток сегментов и таблицу отчёта сегментного анализа.
+
+    Args:
+        data: датасет.
+        feature: наименование признака, сегментация которого будет оцениваться.
+        special_values: специальные значения, под которые нужно выделить сегменты.
+        segments: список границ сегментов, на который будет разбиваться признак.
+        target_feature: наименования целевой переменной.
+        out_path: путь, по которому нужно сохранить таблицу, если он отсутствует, то сохранения не происходит.
+
+    Returns:
+        Возвращает датасет с столбцом меток сегментов и таблицу отчёта сегментного анализа.
+    """
+    df = data.copy(deep=True)
+
+    segment_col_name = f"{feature}_segments"
+
+    df_size = df.shape[0] * 1.0
+    df_bad_count = df[target_feature].sum()
+    df_bad_rate = df[target_feature].mean()    
+
+    segment_report = pd.DataFrame(columns=COLUMNS_SEGMENT_REPORT)
+
+    values = make_values(
+        data=df,
+        feature=feature,
+        special_values=special_values,
+        segments=segments
+    )
+    
+    segment_col_name = f"{feature}_segments"
+    labels = make_segment_col_count_or_cat_feature(
+        data=df,
+        feature=feature,
+        segment_col_name=segment_col_name,
+        values=values,
+        segments=segments,
+        special_values=special_values
+    )
+    labels = sorted(
+        labels,
+        key=lambda x: (
+            int(x[1: x.index(",")])
+            if 
+                x.__contains__("]")
+            else 
+            np.inf if x == "Nan" else eval(x)
+        )
+    )
+
+    for label in labels:
+        segment = df.loc[
+            df[segment_col_name] == label
+        ]
+
+        clients = segment.shape[0]
+        dataset_share = clients / df_size
+        bad_count = segment[target_feature].sum()
+        bad_rate = segment[target_feature].mean()
+        ci_low, ci_high = proportion_confint(
+            count=bad_count,
+            nobs=clients,
+            alpha=0.05,
+            method="wilson"
+        )
+        delta_bad_rate_pp = round((bad_rate - df_bad_rate) * 100, 4)
+        lift = round(bad_rate / df_bad_rate, 4)
+        bad_share = round(bad_count / df_bad_count, 4)
+
+        segment_report.loc[ segment_report.shape[0] ] = [
+            label,
+            clients,
+            dataset_share,
+            df_bad_rate,
+            bad_count,
+            bad_share,
+            bad_rate,
+            ci_low,
+            ci_high,
+            delta_bad_rate_pp,
+            lift
+        ]
+
+    if out_path:
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        dfi.export(segment_report, out_path, table_conversion="matplotlib")
+
+    return (df, segment_report)
+
+--- code cell ---
+navigation["функция для соствления аналитического отчёта по счётному или категориальному признаку"] =\
+    "make_segment_report_count_or_cat_feature"
+
+--- markdown cell ---
+## Функция для создания графиков для анализа корреляции между признаком и targetом
+
+--- code cell ---
+def plot_prebin_bad_rate_continuos_feature(
+    data: pd.DataFrame,
+    feature: str,
+    special_values: list[float] = [],
+    segments: list[float] = [],
+    target_feature: str = "target",
+    out_path: str = ""
+) -> None:
+    """
+    Выводит график сегментов признака и их связи с targetом.
+
+    Args:
+        data: датасет.
+        feature: наименование признака, связь которого будет оцениваться.
+        special_values: специальные значения, под которые нужно выделить сегменты.
+        segments: список сегментов, если он уже есть.
+        target_feature: наименования целевой переменной.
+        out_path: путь, по которому нужно сохранить график, если отсутствует, то ничего не сохраняется.
+
+    Returns:
+        Выводит график.
+    """
+    df = data.copy(deep=True)
+    avg_bad_pct = df[target_feature].mean() * 100
+
+    if not segments:
+        segments = make_segments_continuos_feature(
+            data=df,
+            feature=feature,
+            special_values=special_values
+        )
+
+    segment_col_name = f"{feature}_segments"
+    _ = make_segment_col_continuos_feature(
+        data=df,
+        feature=feature,
+        segment_col_name=segment_col_name,
+        segments=segments,
+        special_values=special_values
+    )
+
+    summary = (
+        df
+        .groupby(by=segment_col_name)
+        .agg(
+            count=(target_feature, "size"),
+            bad_rate=(target_feature, "mean")
+        )
+        .reset_index()
+    )
+    summary["bad_pct"] = summary["bad_rate"] * 100
+
+    plt.figure(figsize=(14, 4))
+
+    ax = sns.barplot(
+        data=summary,
+        x=segment_col_name,
+        y="bad_pct"
+    )
+    ax.bar_label(
+        ax.containers[0],
+        labels=summary["count"],
+        padding=3,
+        rotation=90
+    )
+
+    ax.axhline(
+        y=avg_bad_pct,
+        linestyle='--',
+        color='red',
+        linewidth=1.5,
+        label='dataset bad rate'
+    )
+    ax.legend()
+
+    plt.title(f"Доля target = 1 по группам {feature}")
+    plt.xlabel(f"{feature}")
+    plt.ylabel("Процент target = 1")
+    plt.xticks(rotation=90)
+    plt.grid(axis="y", alpha=0.3)
+
+    if out_path:
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out_path)
+
+    plt.show()
+
+--- code cell ---
+navigation["функция для создания графиков для анализа связи между сегментами непрерывного признака и targetом"] =\
+    "plot_prebin_bad_rate_continuos_feature"
+
+--- code cell ---
+def plot_prebin_bad_rate_count_or_cat_feature(
+    data: pd.DataFrame,
+    feature: str,
+    special_values: list[float] = [],
+    segments: list[float] = [],
+    target_feature: str = "target",
+    out_path: str = ""
+) -> None:
+    """
+    Выводит график сегментов признака и их связи с targetом.
+
+    Args:
+        data: датасет.
+        feature: наименование признака, связь которого будет оцениваться.
+        special_values: специальные значения, под которые нужно выделить сегменты.
+        segments: список сегментов, если он есть.
+        target_feature: наименования целевой переменной.
+        out_path: путь, по которому нужно сохранить график, если отсутствует, то ничего не сохраняется.
+
+    Returns:
+        Выводит график.
+    """
+    df = data.copy(deep=True)
+    avg_bad_pct = df[target_feature].mean() * 100
+
+    values = make_values(
+        data=df,
+        feature=feature,
+        special_values=special_values,
+        segments=segments
+    )
+
+    segment_col_name = f"{feature}_segments"
+    labels = make_segment_col_count_or_cat_feature(
+        data=df,
+        feature=feature,
+        segment_col_name=segment_col_name,
+        values=values,
+        segments=segments,
+        special_values=special_values
+    )
+    labels = sorted(
+        labels,
+        key=lambda x: (
+            int(x[1: x.index(",")])
+            if 
+                x.__contains__("]")
+            else 
+            np.inf if x == "Nan" else eval(x)
+        )
+    )
+
+    summary = (
+        df
+        .groupby(by=segment_col_name)
+        .agg(
+            count=(target_feature, "size"),
+            bad_rate=(target_feature, "mean")
+        )
+        .reset_index()
+    )
+    summary["bad_pct"] = summary["bad_rate"] * 100
+    summary[segment_col_name] = pd.Categorical(
+        summary[segment_col_name],
+        categories=labels,
+        ordered=True
+    )
+    summary = (
+        summary
+        .sort_values(segment_col_name)
+        .reset_index(drop=True)
+    )
+
+    plt.figure(figsize=(14, 4))
+
+    ax = sns.barplot(
+        data=summary,
+        x=segment_col_name,
+        y="bad_pct"
+    )
+    ax.bar_label(
+        ax.containers[0],
+        labels=summary["count"],
+        padding=3,
+        rotation=90
+    )
+
+    ax.axhline(
+        y=avg_bad_pct,
+        linestyle='--',
+        color='red',
+        linewidth=1.5,
+        label='dataset bad rate'
+    )
+    ax.legend()
+
+    plt.title(f"Доля target = 1 по группам {feature}")
+    plt.xlabel(f"{feature}")
+    plt.ylabel("Процент target = 1")
+    plt.xticks(rotation=90)
+    plt.grid(axis="y", alpha=0.3)
+
+    if out_path:
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out_path)
+
+    plt.show()
+
+--- code cell ---
+navigation["функция для создания графиков для анализа связи между сегментами счётного или категориального признака и targetом"] =\
+    "plot_prebin_bad_rate_count_or_cat_feature"
+
+--- markdown cell ---
+## Функция для оценки значимости сегментирования
+
+--- code cell ---
+def stat_power_segments(
+    segmented_data: pd.DataFrame,
+    segment_col_name: str,
+    target_feature: str
+) -> tuple[bool, float]:
+    """
+    Возвращает p_value < 0.0001 и значение Cramer's V теста.
+
+    Args:
+        segmented_data: датасет со столбцом меток сегментов.
+        segment_col_name: наименование столбца меток сегментов.
+        target_feature: наименования целевой переменной.
+
+    Returns:
+        Возвращает p_value < 0.0001 и значение Cramer's V теста.
+    """
+    contingency_table = pd.crosstab(
+        segmented_data[segment_col_name],
+        segmented_data[target_feature]
+    )
+
+    chi2, p_value, _, _ = chi2_contingency(
+        contingency_table
+    )
+
+    n = contingency_table.to_numpy().sum()
+    r, c = contingency_table.shape
+    cramers_v = np.sqrt(
+        chi2 / (n * min(r - 1, c - 1))
+    )
+
+    return (p_value < 0.0001, cramers_v)
+
+--- code cell ---
+navigation["функция для оценки значимости сегментирования"] = "stat_power_segments"
+
+--- markdown cell ---
+## Схема оценивания силы связи Cramer's V.
+
+--- code cell ---
+cramers_v_scheme = pd.DataFrame({
+    "Cramer's V": ["< 0.1", "0.1-0.3", "0.3-0.5", "> 0.5"],
+    "Эвристическая интерпретация": ["очень слабая", "слабая", "умеренная", "сильная"]
+})
+
+--- code cell ---
+navigation["схема оценивая силы связи Cramer's V"] = "cramers_v_scheme"
+
+--- markdown cell ---
+## Функция для составления таблицы количественных характеристик pandas DataFrame
+
+--- code cell ---
+def make_num_charactericstic_table(
+    data: pd.DataFrame,
+    percentiles: list[float] = [0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 0.995]
+) -> pd.DataFrame:
+    return data.drop(columns="target", errors="ignore").describe(percentiles=percentiles).T
+
+--- code cell ---
+navigation["функция для составления таблицы количественных характеристик"] = "make_num_characteristic_table"
+
+--- markdown cell ---
+## Функция для вычисления количественных характеристик сегмента признака
+
+--- code cell ---
+def cacl_segment_characteristics(
+    segment: pd.DataFrame,
+    dataset_size: int,
+    dataset_num_bad_events: int,
+    dataset_bad_rate: float
+):
+    size = segment.shape[0]
+    dataset_share = (segment.shape[0] * 1.0)/ dataset_size
+    bad_share = (segment["target"].sum() * 1.0) / dataset_num_bad_events
+    bad_rate = segment["target"].mean()
+    lift = bad_rate / dataset_bad_rate
+    borrowers_idx = set(segment["borrower_id"].to_list())
+    borrowers_t1_idx = set(
+        segment.loc[segment["target"] == 1, "borrower_id"].to_list()
+    )
+
+    return [
+        size,
+        dataset_share,
+        bad_share,
+        bad_rate,
+        lift,
+        borrowers_idx,
+        borrowers_t1_idx
+    ]
+
+--- markdown cell ---
+## Вычисление количественных характеристик пересечения двух сегментов
+
+--- code cell ---
+def calc_segments_intersection_characteristics(
+    feature_1_segmented_data: pd.DataFrame,
+    feature_1: str,
+    segments_1: list[str],
+    feature_2_segmented_data: pd.DataFrame,
+    feature_2: str,
+    segments_2: list[str],
+    dataset_size: int,
+    dataset_num_bad_events: int,
+    dataset_bad_rate: float,
+    result: pd.DataFrame
+):
+    f1sd = feature_1_segmented_data.copy(deep=True)
+    f1_s_col = f"{feature_1}_segments"
+    f2sd = feature_2_segmented_data.copy(deep=True)
+    f2_s_col = f"{feature_2}_segments"
+    
+    for segment_1 in segments_1:
+        s_1 = f1sd[f1sd[f1_s_col] == segment_1]
+        size_1, dataset_share_1, bad_share_1, bad_rate_1, lift_1, borrowers_idx_1, borrowers_t1_idx_1 =\
+            cacl_segment_characteristics(
+            s_1,
+            dataset_size,
+            dataset_num_bad_events,
+            dataset_bad_rate
+        )
+
+        for segment_2 in segments_2:
+            s_2 = f2sd[f2sd[f2_s_col] == segment_2]
+            size_2, dataset_share_2, bad_share_2, bad_rate_2, lift_2, borrowers_idx_2, borrowers_t1_idx_2 =\
+                cacl_segment_characteristics(
+                    s_2,
+                    dataset_size,
+                    dataset_num_bad_events,
+                    dataset_bad_rate
+                )
+
+            size = len(borrowers_idx_1 & borrowers_idx_2)
+            dataset_share = (size * 1.0) / dataset_size
+            bad_events = len(borrowers_t1_idx_1 & borrowers_t1_idx_2)
+            bad_share = (bad_events * 1.0) / dataset_num_bad_events
+            bad_rate = (bad_events * 1.0) / size if size > 0 else 0
+            lift = bad_rate / dataset_bad_rate
+
+            ci_low_bad_rate, ci_high_bad_rate =\
+                [0.0, 0.0] if size == 0 else proportion_confint(
+                    count=bad_events,
+                    nobs=size,
+                    alpha=0.05,
+                    method="wilson"
+                )
+
+            result.loc[ result.shape[0] ] = [
+                feature_1,
+                segment_1,
+                feature_2,
+                segment_2,
+                size_1,
+                size_2,
+                size,
+                dataset_share_1,
+                dataset_share_2,
+                dataset_share,
+                bad_share_1,
+                bad_share_2,
+                bad_share,
+                bad_events,
+                bad_rate_1,
+                bad_rate_2,
+                bad_rate,
+                ci_low_bad_rate,
+                ci_high_bad_rate,
+                lift_1,
+                lift_2,
+                lift
+            ]
+
+--- markdown cell ---
+## Функция создания отчёта по пересечению сегментов
+
+--- code cell ---
+COLS = [
+    "Feature 1",
+    "Segment 1",
+    "Feature 2",
+    "Segment 2",
+    "Size 1",
+    "Size 2",
+    "Size",
+    "Dataset Share 1",
+    "Dataset Share 2",
+    "Dataset Share",
+    "Bad Share 1",
+    "Bad Share 2",
+    "Bad Share",
+    "Bad Events",
+    "Bad Rate 1",
+    "Bad Rate 2",
+    "Bad Rate",
+    "CI Low",
+    "CI High",
+    "Lift 1",
+    "Lift 2",
+    "Lift"
+]
+
+def make_pairwise_segments_analysis(
+    features_segmented_datas: list[pd.DataFrame],
+    features: list[str],
+    segments: list[list[str]],
+    dataset_size: int,
+    dataset_num_bad_events: int,
+    dataset_bad_rate: float
+) -> pd.DataFrame:
+    pairwise_segments_report = pd.DataFrame(columns=COLS)
+    
+    num_features = len(features_segmented_datas)
+    for i in range(num_features - 1):
+        feature_1_segmented_data = features_segmented_datas[i]
+        feature_1 = features[i]
+        segments_1 = segments[i]
+
+        for j in range(i+1, num_features):
+            feature_2_segmented_data = features_segmented_datas[j]
+            feature_2 = features[j]
+            segments_2 = segments[j]
+
+            calc_segments_intersection_characteristics(
+                feature_1_segmented_data=feature_1_segmented_data,
+                feature_1=feature_1,
+                segments_1=segments_1,
+                feature_2_segmented_data=feature_2_segmented_data,
+                feature_2=feature_2,
+                segments_2=segments_2,
+                dataset_size=dataset_size,
+                dataset_num_bad_events=dataset_num_bad_events,
+                dataset_bad_rate=dataset_bad_rate,
+                result=pairwise_segments_report
+            )
+
+    return pairwise_segments_report
+
+--- code cell ---
+navigation["функция для формирования отчёта по пересечению сегментов"] = "make_pairwise_segments_analysis"
+
+--- markdown cell ---
+## Форматирование отчёта по пересечению сегментов
+
+--- code cell ---
+def make_prettier_pairwise_report(
+    pairwise_report: pd.DataFrame,
+    dataset_size: int,
+    dataset_share_threshold: float,
+    dataset_num_bad_events: int,
+    bad_share_threshold: float
+) -> pd.DataFrame:
+    pairwise_report = pairwise_report.copy(deep=True)
+
+    dataset_share_threshold = dataset_size * dataset_share_threshold
+    bad_share_threshold = dataset_num_bad_events * bad_share_threshold
+
+    pairwise_report = pairwise_report.query(
+        f"(Size > {dataset_share_threshold}) &"
+        f"(`Bad Events` > {bad_share_threshold})"
+    )
+    pairwise_report = pairwise_report.query("(`Lift 1` < Lift) & (`Lift 2` < Lift)")
+
+    pairwise_report["Expected Share"] =\
+        pairwise_report["Dataset Share 1"] * pairwise_report["Dataset Share 2"] * 1.0
+    pairwise_report["Overlap Ratio"] = pairwise_report.apply(
+        lambda x: True if x["Dataset Share"] * 1.0 / x["Expected Share"] > 1.0 else False,
+        axis=1
+    )
+    pairwise_report["Features"] = pairwise_report.apply(
+        lambda x: f"{x["Feature 1"]}\n{x["Feature 2"]}",
+        axis=1
+    )
+    pairwise_report["Segments"] = pairwise_report.apply(
+        lambda x: f"{x["Segment 1"]}\n{x["Segment 2"]}",
+        axis=1
+    )
+    pairwise_report["Min Parent Size"] = pairwise_report[["Size 1", "Size 2"]].min(axis=1)
+    pairwise_report["Retention From Smaller Parent"] = pairwise_report.apply(
+        lambda x: x["Size"] * 1.0 / x["Min Parent Size"],
+        axis=1
+    )
+    pairwise_report["Max Parent Bad Rate"] = pairwise_report[["Bad Rate 1", "Bad Rate 2"]].max(axis=1)
+    pairwise_report["Delta Bad Rate"] = pairwise_report["Bad Rate"] - pairwise_report["Max Parent Bad Rate"]
+    pairwise_report["Max Parent Lift"] = pairwise_report[["Lift 1", "Lift 2"]].max(axis=1)
+    pairwise_report["Delta Lift"] = pairwise_report["Lift"] - pairwise_report["Max Parent Lift"]
+
+    pairwise_report = pairwise_report[
+        [
+            "Features",
+            "Segments",
+            "Size",
+            "Overlap Ratio",
+            "Retention From Smaller Parent",
+            "Dataset Share",
+            "Bad Events",
+            "Bad Share",
+            "Bad Rate",
+            "CI Low",
+            "CI High",
+            "Delta Bad Rate",
+            "Lift",
+            "Delta Lift"
+        ]
+    ]
+
+    return pairwise_report
+
+--- code cell ---
+navigation["функция для форматирования отчёта по пересечению признаков"] = "make_prettier_pairwise_report"
+
+--- markdown cell ---
+# Загрузка датасета
+
+--- code cell ---
+data = pd.read_csv("../data/interim/borrowers.csv")
+data["borrower_id"] = np.arange(1, data.shape[0] + 1)
+
+--- code cell ---
+navigation["переменная датасета"] = "data"
+
+--- markdown cell ---
+# Risk Analysis
+
+--- markdown cell ---
+## Business Questions
+
+--- markdown cell ---
+**Цель анализа** - исследовать структуру кредитного риска портфеля и определить характеристики заёмщиков, связанные с повышенной вероятностью серьёзной просрочки в следующие два года.
+
+--- markdown cell ---
+**Бизнес-вопросы:**
+1. Какие характеристики сильнее всего связаны с bad rate?
+2. Какие рискованные сегменты достаточно велики, чтобы существенно влиять на качество всего портфеля?
+3. Какие характеристики дают выраженный risk gradient?
+4. Какие сочетания характеристик особенно рискованы?
+
+--- code cell ---
+business_questions = [
+    "Какие характеристики сильнее всего связаны с bad rate?",
+    "Какие рискованные сегменты достаточно велики, чтобы существенно влиять на качество всего портфеля?",
+    "Какие характеристики дают выраженный risk gradient?",
+    "Какие сочетания характеристик особенно рискованы?"
+]
+
+--- code cell ---
+navigation["бизнес-вопросы анализа"] = "business_questions"
+
+--- markdown cell ---
+## Методология
+
+--- markdown cell ---
+**Анализ каждого признака будет проводиться следующим образом:**
+1. Вычислить предварительные сегменты разделения признака;
+2. По предварительно вычисленным сегментам построить график, отражающий сегменты и их bad rate;
+3. Опираясь на график и бизнес-значения сегментов, построить окончательные сегменты;
+4. По вычисленным сегментам составить отчёт по **ключевым метрикам сегнмета**;
+5. По вычисленным сегментам составить итоговый график, отражающий сегменты и их bad rate;
+6. Выполнить $\chi^{2}$ и Cramer's V тесты для проверки зависимости между сегментами признака и target;
+7. На основе полученного отчёта и графика сделать итоговый вывод по признаку;
+
+Такой подход позволит просто и наглядно оценить сегменты, изменение в них рисков и статистическую значимость этих изменений.
+
+--- markdown cell ---
+**Ключевые метрики сегмента:**
+1. segment - выбранный сегмент у признака;
+2. clients - размер сегмента (количество заёмщиков);
+3. dataset_share - какую часть от всего датасета занимает сегмент:
+$$\text{dataset\_share} = \text{segment.size()} / \text{dataset.size()}$$
+4. dataset_bad_rate - общий процент bad events по всему датасету;
+5. bad_count - количество bad events в сегменте;
+6. bad_share - какую часть bad events сегмента составляют от всех bad events:
+$$\text{bad\_share} = \text{segment\_bad\_events} / \text{all\_bad\_events}$$
+7. bad_rate - доля bad events от размера сегмента:
+$$\text{bad\_rate} = \text{segment\_bad\_events} / \text{segment.size()}$$
+8. ci_low - нижняя граница доверительного интервала bad rate сегмента;
+9. ci_high - верхняя граница доверительного интервала bad rate сегмента;
+10. delta_bad_rate_pp - разность между bad_rate сегмента и среднего bad_rate по всему датасету:
+$$\text{delta\_bad\_rate\_pp} = \text{segment\_bad\_rate} - \text{dataset\_bad\_rate}$$
+11. lift - отношение bad rate сегмента к bad rate по всему датасету:
+$$\text{lift} = \text{segment\_bad\_rate} / \text{dataset\_bad\_rate}$$
+
+--- code cell ---
+key_segment_metrics = {
+    "segment": "выбранный сегмент у признака",
+    "clients": "размер сегмента (количество заёмщиков)",
+    "dataset_share": "какую часть от всего датасета занимает сегмент",
+    "dataset_bad_rate": "общий процент bad events по всему датасету",
+    "bad_count": "количество bad events в сегменте",
+    "bad_share": "какую часть bad events сегмента составляют от всех bad events",
+    "ci_low": "нижняя граница доверительного интервала bad rate сегмента",
+    "ci_high": "верхняя граница доверительного интервала bad rate сегмента",
+    "delta_bad_rate_pp": "разность между bad_rate сегмента и среднего bad_rate по всему датасету",
+    "lift": "отношение bad rate сегмента к bad rate по всему датасету"
+}
+
+--- code cell ---
+navigation["ключевые метрики сегмента"] = "key_segment_metrics"
+
+--- markdown cell ---
+## Dataset Overview
+
+--- markdown cell ---
+Общие характеристики датасета.
+
+--- code cell ---
+ci_low_bad_rate_overall, ci_high_bad_rate_overall = proportion_confint(
+    count=data["target"].sum(),
+    nobs=data.shape[0],
+    alpha=0.05,
+    method="wilson"
+)
+
+ci_bad_rate_overall = (round(ci_low_bad_rate_overall, 4), round(ci_high_bad_rate_overall, 4))
+
+--- code cell ---
+navigation["доверительный интервал bad rate датасета"] = "ci_bad_rate_overall"
+
+--- code cell ---
+dataset_overview = pd.DataFrame({
+    "Metric": ["Borrowers", "Goods", "Bads", "Bad rate", "95% CI"],
+    "Value": [
+        data.shape[0],
+        data.shape[0] - data["target"].sum(),
+        data["target"].sum(),
+        round(data["target"].mean(), 4),
+        ci_bad_rate_overall
+    ]
+})
+
+--- code cell ---
+navigation["краткий обзор датасета"] = "dataset_overview"
+
+--- markdown cell ---
+Краткое описание характеристик датасета.
+
+--- code cell ---
+dataset_overview
+
+--- markdown cell ---
+## Risk Factor Analysis
+
+--- code cell ---
+features_reports_names = {}
+features_connects_powers = {}
+risk_factor_notes = pd.DataFrame(columns=[
+    "feature",
+    "segments",
+    "high risk segments",
+    "low risk segments",
+    "summary high risk segments",
+    "notes for interaction analysis",
+    "Chi^2 test",
+    "Cramer's V"
+])
+
+--- code cell ---
+navigation["список наименований отчётов по признакам"] = "features_reports_names"
+navigation["список оценок сил связи между сегментами и targetом"] = "features_connects_powers"
+navigation["risk factor notes"] = "risk_factor_notes"
+
+--- markdown cell ---
+### `revolving_utilization`
+
+--- markdown cell ---
+**Построим график предварительных risk-сегментов.**
+
+--- code cell ---
+plot_prebin_bad_rate_continuos_feature(
+    data=data,
+    feature="revolving_utilization"
+)
+
+--- markdown cell ---
+Предварительные сегменты стоит укрупнить. Выполнять это будем опираясь на бизнес-значения самих сегментов и структуру их bad rate.
+
+--- markdown cell ---
+**Выделим следующие сегменты:**
+1. [0.0, 0.2];
+2. (0.2, 0.4];
+3. (0.4, 0.5];
+4. (0.5, 0.7];
+5. (0.7, 1.0];
+6. (1.0, 2.0];
+7. (2.0, 5.0];
+8. (5.0, np.inf]
+
+Такие сегменты сохранят примерный уровень разделения риска по сегментам и будут иметь логичный бизнес-смысл (низкий, средний, высокий, overdraft, экстремальные и огромные значения).
+
+--- code cell ---
+segments = [0.0, 0.2, 0.4, 0.5, 0.7, 1.0, 2.0, 5.0, np.inf]
+
+--- markdown cell ---
+**Построим отчёт по полученным сегментам и итоговый график.**
+
+--- code cell ---
+revolving_utilization_segmented_data, revolving_utilization_report = make_segment_report_continuos_feature(
+    data=data,
+    feature="revolving_utilization",
+    segments=segments,
+    out_path="../data/risk_analysis/revolving_utilization/revolving_utilization_report.png"
+)
+
+--- code cell ---
+features_reports_names["revolving_utilization"] = "revolving_utilization_report"
+
+--- code cell ---
+plot_prebin_bad_rate_continuos_feature(
+    data=data,
+    feature="revolving_utilization",
+    segments=segments,
+    out_path="../data/risk_analysis/revolving_utilization/revolving_utilization_graphic.png"
+)
+
+--- code cell ---
+revolving_utilization_report
+
+--- markdown cell ---
+Большинство сегментов содержит достаточно наблюдений, вследствие чего доверительные интервалы bad rate сравнительно узкие и оценки имеют хорошую статистическую точность.
+
+Последний и предпоследний сегменты не объёмны, поэтому их оценка bad rate сильно теряет в точности.
+
+--- markdown cell ---
+**Оценим статистическую значимость сегментирования.**
+
+--- code cell ---
+p_value, cramers_v = stat_power_segments(
+    segmented_data=revolving_utilization_segmented_data,
+    segment_col_name="revolving_utilization_segments",
+    target_feature="target"
+)
+
+--- code cell ---
+p_value, cramers_v
+
+--- code cell ---
+features_connects_powers["revolving_utilization"] = f"{p_value}; {cramers_v}"
+
+--- markdown cell ---
+Схема оценивания силы связи.
+
+--- code cell ---
+cramers_v_scheme
+
+--- markdown cell ---
+Распределение target статистически различается между сегментами `revolving_utilization` ($\chi^{2}$ test, p < 0.001).
+
+Cramer's V $\approx$ 0.30 указывает на заметную связь между сегментом utilization и target в исследуемой выборке.
+
+--- markdown cell ---
+**Вывод по признаку:**
+
+У `revolving_utilization` наблюдается выраженная нелинейная связь с будущей серьёзной просрочкой. В диапазоне до 0.5 bad rate находится около или ниже по датасету, после чего риск заметно возрастает. Сегмент 0.7-1.0 составляет около 17.7% датасета, но формирует ~47.1% всех bad events; его bad rate равен 17.7%, что в 2.65 раза выше среднего. Наиболее высокий bad rate (~40%) наблюдается в диапазоне 1.0-2.0, однако этот сегмент значительно меньше - около 2% датасета. Диапазон 2.0-5.0 поддерживает высокий bad rate (~29%), но стоит учитывать малый объём сегмента ~0.08% датасета, хотя даже нижняя граница CI выше среднего bad rate в 3.1 раза. Для огромных значений, выше 5.0, связь исчезает: сегмент мал, CI широк, а bad rate близок к среднему по датасету, поэтому его стоит интерпретировать отдельно.
+
+--- code cell ---
+risk_factor_notes.loc[ risk_factor_notes.shape[0] ] = [
+    "revolving_utilization",
+    "1. [0.0, 0.2]\n2. (0.2, 0.4]\n3. (0.4, 0.5]\n4. (0.5, 0.7]\n5. (0.7, 1.0]\n6. (1.0, 2.0]\n7. (2.0, 5.0]\n8. (5.0, inf]",
+    "1. (0.5, 0.7] || 7.5% || 10.8% || 9.5%\n"
+    "2. (0.7, 1.0] || 17.7% || 47.0% || 17.7%\n"
+    "3. (1.0, 2.0] || 2.0% || 11.8% || 40.1%\n"
+    "4. (2.0, 5.0] || 0.08% || 0.3% || 29.0%",
+    "1. [0.0, 0.2] || 54.5% || 16.4% || 2.0%\n"
+    "2. (0.2, 0.4] || 13.2% || 8.6% || 4.4%",
+    "Сегменты (0.7, 1.0] и (1.0, 2.0] являются очень сильными маркерами риска, они формируют примерно 58% всех bad events, "
+    "хотя составляют всего порядка 19% датасета.",
+    "Сегменты (0.7, 1.0] и (1.0, 2.0] занимают примерно пятую часть датасета и половину bad "
+    "events. Можно пробовать добавлять условия к этим достаточно объёмным сегментам и пытаться "
+    "повышать bad rate более узкими условиями.",
+    p_value,
+    cramers_v
+]
+
+--- markdown cell ---
+### `age`
+
+--- markdown cell ---
+**Построим график предварительных risk-сегментов.**
+
+--- code cell ---
+plot_prebin_bad_rate_continuos_feature(
+    data=data,
+    feature="age"
+)
+
+--- markdown cell ---
+Предварительные сегменты стоит укрупнить. Выполнять это будем опираясь на бизнес-значения самих сегментов и структуру их bad rate.
+
+--- markdown cell ---
+**Выделим следующие сегменты:**
+1. [0.0, 22.0];
+2. (22.0, 30.0];
+3. (30.0, 45.0];
+4. (45.0, 55.0];
+5. (55.0, 75.0];
+6. (75.0, np.inf]
+
+Такие сегменты сохранят примерный уровень разделения риска по сегментам и будут иметь логичный бизнес-смысл (очень молодые, молодые, средний возраст, возрастные, пожилые, экстремальные).
+
+--- code cell ---
+segments = [0.0, 22.0, 30.0, 45.0, 55.0, 75.0, np.inf]
+
+--- markdown cell ---
+**Построим отчёт по полученным сегментам и итоговый график.**
+
+--- code cell ---
+age_segmented_data, age_report = make_segment_report_continuos_feature(
+    data=data,
+    feature="age",
+    segments=segments,
+    out_path="../data/risk_analysis/age/age_report.png"
+)
+
+--- code cell ---
+features_reports_names["age"] = "age_report"
+
+--- code cell ---
+plot_prebin_bad_rate_continuos_feature(
+    data=data,
+    feature="age",
+    segments=segments,
+    out_path="../data/risk_analysis/age/age_graphic.png"
+)
+
+--- code cell ---
+age_report
+
+--- markdown cell ---
+Cегменты содержат достаточно наблюдений, вследствие чего доверительные интервалы bad rate сравнительно узкие и оценки имеют хорошую статистическую точность.
+
+--- markdown cell ---
+**Оценим статистическую значимость сегментирования.**
+
+--- code cell ---
+p_value, cramers_v = stat_power_segments(
+    segmented_data=age_segmented_data,
+    segment_col_name="age_segments",
+    target_feature="target"
+)
+
+--- code cell ---
+p_value, cramers_v
+
+--- code cell ---
+features_connects_powers["age"] = f"{p_value}; {cramers_v}"
+
+--- markdown cell ---
+Схема оценивания силы связи.
+
+--- code cell ---
+cramers_v_scheme
+
+--- markdown cell ---
+Распределение target статистически различается между сегментами `age` ($\chi^{2}$ test, p < 0.001).
+
+Cramer's V $\approx$ 0.11 указывает на небольшую связь между сегментом age и target в исследуемой выборке.
+
+--- markdown cell ---
+**Вывод по признаку:**
+
+У `age` наблюдается некоторая нелинейная связь с будущей серьёзной просрочкой. В диапазоне от до 22 лет bad rate находится немного выше по датасету, после чего риск начинает расти. В следующем сегменте, 22-30 лет, bad rate достигает своего пика ~11.8%, составляя при этом ~6.7% датасета и формируя ~12% всех bad events, превышая средний bad rate по датасету при этом в ~1.76 раза. В следующем сегменте, 30-45 лет, риск снижается, падая до ~9.3% и формируя ~37.6% всех bad events. В сегменте 45-55 лет bad rate падает ещё сильнее до ~7.6%, при этом сегмент формирует ~27.8% всех bad events. В последних двух сегментах bad rate достигает своего минимума - ~1.8%, составляя при этом 41.3% всего датасета и формируя всего 3.92% всех bad events.
+
+--- code cell ---
+risk_factor_notes.loc[ risk_factor_notes.shape[0] ] = [
+    "age",
+    "1. [0.0, 22.0]\n2. (22.0, 30.0]\n3. (30.0, 45.0]\n4. (45.0, 55.0]\n5. (55.0, 75.0]\n6. (75.0, inf]",
+    "1. (22.0, 30.0] || 6.7% || 11.9% || 11.7%\n"
+    "2. (30.0, 45.0] || 27.0% || 37.6% || 9.3%",
+    "1. [55.0, 75.0] || 34.6% || 20.1% || 3.8%\n"
+    "2. (75.0, inf] || 6.7% || 2.0% || 2.0%",
+    "Сегменты (22.0, 30.0] и (30.0, 45.0] являются не очень сильными маркерами риска, они формируют примерно 49% всех bad events, "
+    "но составляют при этом примерно 34% датасета.",
+    "Сегменты (22.0, 30.0] и (30.0, 45.0] занимают примерно треть датасета и половину bad "
+    "events. Можно пробовать добавлять условия к этим достаточно объёмным сегментам и пытаться "
+    "повышать bad rate более узкими условиями.",
+    p_value,
+    cramers_v
+]
+
+--- markdown cell ---
+### `num_30_59_days_late`
+
+--- markdown cell ---
+**Построим график предварительных risk-сегментов.**
+
+--- code cell ---
+plot_prebin_bad_rate_count_or_cat_feature(
+    data=data,
+    feature="num_30_59_days_late",
+    special_values=[96, 98]
+)
+
+--- markdown cell ---
+Предварительные сегменты стоит укрупнить. Выполнять это будем опираясь на бизнес-значения самих сегментов и структуру их bad rate.
+
+--- markdown cell ---
+**Выделим следующие сегменты:**
+1. 0;
+2. [1, 2];
+3. (2, np.inf];
+4. 96;
+5. 98.
+
+Такие сегменты сохранят примерный уровень разделения риска по сегментам и будут иметь логичный бизнес-смысл (нет, одна, больше 1).
+
+--- code cell ---
+segments = [1, 2, 13]
+
+--- markdown cell ---
+**Построим отчёт по полученным сегментам и итоговый график.**
+
+--- code cell ---
+num_30_59_days_late_segmented_data, num_30_59_days_late_report = make_segment_report_count_or_cat_feature(
+    data=data,
+    feature="num_30_59_days_late",
+    special_values=[96, 98],
+    segments=segments,
+    out_path="../data/risk_analysis/num_30_59_days_late/num_30_59_days_late_report.png"
+)
+
+--- code cell ---
+features_reports_names["num_30_59_days_late"] = "num_30_59_days_late_report"
+
+--- code cell ---
+plot_prebin_bad_rate_count_or_cat_feature(
+    data=data,
+    feature="num_30_59_days_late",
+    special_values=[96, 98],
+    segments=segments,
+    out_path="../data/risk_analysis/num_30_59_days_late/num_30_59_days_late_graphic.png"
+)
+
+--- code cell ---
+num_30_59_days_late_report
+
+--- markdown cell ---
+Большинство сегментов содержит достаточно наблюдений, вследствие чего доверительные интервалы bad rate сравнительно узкие и оценки имеют хорошую статистическую точность.
+
+Последний и предпоследний сегменты не объёмны, поэтому их оценка bad rate сильно теряет в точности. Тем не менее, данные сегменты необходимы исходя из бизнес логики (предположительно системные коды).
+
+--- markdown cell ---
+**Оценим статистическую значимость сегментирования.**
+
+--- code cell ---
+p_value, cramers_v = stat_power_segments(
+    segmented_data=num_30_59_days_late_segmented_data,
+    segment_col_name="num_30_59_days_late_segments",
+    target_feature="target"
+)
+
+--- code cell ---
+p_value, cramers_v
+
+--- code cell ---
+features_connects_powers["num_30_59_days_late"] = f"{p_value}; {cramers_v}"
+
+--- markdown cell ---
+Схема оценивания силы связи.
+
+--- code cell ---
+cramers_v_scheme
+
+--- markdown cell ---
+Распределение target статистически различается между сегментами `num_30_59_days_late` ($\chi^{2}$ test, p < 0.001).
+
+Cramer's V $\approx$ 0.278 указывает на заметную связь между сегментом num_30_59_days_late и target в исследуемой выборке.
+
+--- markdown cell ---
+**Вывод по признаку:**
+
+У `num_30_59_days_late` наблюдается выраженная нелинейная связь с будущей серьёзной просрочкой. У людей без краткосрочных просрочек bad rate находится ниже по датасету, после чего риск заметно возрастает. Сегмент 1-2 составляет около 13.7% датасета, но формирует ~36.2% всех bad events; его bad rate равен ~17.6%, что в 2.63 раза выше среднего. Далее bad rate растёт ещё сильнее, достигая ~39.2%, в диапазоне (2, 13], однако данный сегмент значительно меньше - около 2% датасета. Сегменты системных кодов имеют очень высокий bad rate ~80%, ~54% соответственно, но стоит учитывать малые объёмы сегментов, которые делают оценку bad rate в них крайне неточной.
+
+--- code cell ---
+risk_factor_notes.loc[ risk_factor_notes.shape[0] ] = [
+    "num_30_59_days_late",
+    "1. 0\n2. [1, 2]\n3. (2, 13]\n4. 96\n5. 98",
+    "1. [1, 2] || 13.7% || 36.1% || 11.6%\n"
+    "2. (2, 13] || 2.0% || 12.0% || 39.2%\n"
+    "3. 96 || 0% || 0.04% || 80.0%\n"
+    "4. 98 || 0.18% || 1.4% || 54.1%",
+    "1. 0 || 84.0% || 50.2% || 4.0%",
+    "Сегменты [1, 2] и (2, 13] являются очень сильными маркерами риска, они формируют примерно 48% всех bad events, "
+    "хотя составляют при этом всего 16% датасета.",
+    "Сегмент [1, 2] занимает примерно 13.% датасета и треть bad "
+    "events. Можно пробовать добавлять условия к этому сегментаму и пытаться "
+    "повысить bad rate сузив его дополнительными условиями.",
+    p_value,
+    cramers_v
+]
+
+--- markdown cell ---
+### `num_60_89_days_late`
+
+--- markdown cell ---
+**Построим график предварительных risk-сегментов.**
+
+--- code cell ---
+plot_prebin_bad_rate_count_or_cat_feature(
+    data=data,
+    feature="num_60_89_days_late",
+    special_values=[96, 98]
+)
+
+--- markdown cell ---
+Предварительные сегменты стоит укрупнить. Выполнять это будем опираясь на бизнес-значения самих сегментов и структуру их bad rate.
+
+--- markdown cell ---
+**Выделим следующие сегменты:**
+1. 0;
+2. [1, 2];
+3. (2, np.inf];
+4. 96;
+5. 98.
+
+Такие сегменты сохранят примерный уровень разделения риска по сегментам и будут иметь логичный бизнес-смысл (нет, одна, больше 1).
+
+--- code cell ---
+segments = [1, 2, 11]
+
+--- markdown cell ---
+**Построим отчёт по полученным сегментам и итоговый график.**
+
+--- code cell ---
+num_60_89_days_late_segmented_data, num_60_89_days_late_report = make_segment_report_count_or_cat_feature(
+    data=data,
+    feature="num_60_89_days_late",
+    special_values=[96, 98],
+    segments=segments,
+    out_path="../data/risk_analysis/num_60_89_days_late/num_60_89_days_late_report.png"
+)
+
+--- code cell ---
+features_reports_names["num_60_89_days_late"] = "num_60_89_days_late_report"
+
+--- code cell ---
+plot_prebin_bad_rate_count_or_cat_feature(
+    data=data,
+    feature="num_60_89_days_late",
+    special_values=[96, 98],
+    segments=segments,
+    out_path="../data/risk_analysis/num_60_89_days_late/num_60_89_days_late_graphic.png"
+)
+
+--- code cell ---
+num_60_89_days_late_report
+
+--- markdown cell ---
+Большинство сегментов содержит достаточно наблюдений, вследствие чего доверительные интервалы bad rate сравнительно узкие и оценки имеют хорошую статистическую точность.
+
+Последний и предпоследний сегменты не объёмны, поэтому их оценка bad rate сильно теряет в точности. Тем не менее, данные сегменты необходимы исходя из бизнес логики (предположительно системные коды).
+
+--- markdown cell ---
+**Оценим статистическую значимость сегментирования.**
+
+--- code cell ---
+p_value, cramers_v = stat_power_segments(
+    segmented_data=num_60_89_days_late_segmented_data,
+    segment_col_name="num_60_89_days_late_segments",
+    target_feature="target"
+)
+
+--- code cell ---
+p_value, cramers_v
+
+--- code cell ---
+features_connects_powers["num_60_89_days_late"] = f"{p_value}; {cramers_v}"
+
+--- markdown cell ---
+Схема оценивания силы связи.
+
+--- code cell ---
+cramers_v_scheme
+
+--- markdown cell ---
+Распределение target статистически различается между сегментами `num_60_89_days_late` ($\chi^{2}$ test, p < 0.001).
+
+Cramer's V $\approx$ 0.282 указывает на заметную связь между сегментом num_60_89_days_late и target в исследуемой выборке.
+
+--- markdown cell ---
+**Вывод по признаку:**
+
+У `num_60_89_days_late` наблюдается выраженная нелинейная связь с будущей серьёзной просрочкой. У людей без среднесрочных просрочек bad rate находится ниже по датасету, после чего риск заметно возрастает. Сегмент 1-2 составляет около 4.6% датасета, но формирует ~23.3% всех bad events; его bad rate равен ~34.1%, что в 5.1 раза выше среднего. Далее bad rate растёт ещё сильнее, достигая ~58.6%, в диапазоне (2, 11], однако данный сегмент значительно меньше - около 0.3% датасета. Сегменты системных кодов имеют очень высокий bad rate ~80%, ~54% соответственно, но стоит учитывать малые объёмы сегментов, которые делают оценку bad rate в них крайне неточной.
+
+--- code cell ---
+risk_factor_notes.loc[ risk_factor_notes.shape[0] ] = [
+    "num_60_89_days_late",
+    "1. 0\n2. [1, 2]\n3. (2, 11]\n4. 96\n5. 98",
+    "1. [1, 2] || 4.6% || 23.3% || 34.1%\n"
+    "2. (2, 11] || 0.3% || 2.8% || 58.6%\n"
+    "3. 96 || 0% || 0.04% || 80.0%\n"
+    "4. 98 || 0.18% || 1.4% || 54.1%",
+    "1. 0 || 95.0% || 72.3% || 5.1%",
+    "Сегменты [1, 2] и (2, 11] являются очень сильными маркерами риска, пусть они и составляют примерно 4.6% датасета, "
+    "но формируют целых 23.3% всех bad events, а также имеют крайне высокий уровень риска (34.1%, 58.6% соответственно).",
+    "-",
+    p_value,
+    cramers_v
+]
+
+--- markdown cell ---
+### `num_90_days_late`
+
+--- markdown cell ---
+**Построим график предварительных risk-сегментов.**
+
+--- code cell ---
+plot_prebin_bad_rate_count_or_cat_feature(
+    data=data,
+    feature="num_90_days_late",
+    special_values=[96, 98]
+)
+
+--- markdown cell ---
+Предварительные сегменты стоит укрупнить. Выполнять это будем опираясь на бизнес-значения самих сегментов и структуру их bad rate.
+
+--- markdown cell ---
+**Выделим следующие сегменты:**
+1. 0;
+2. [1, 2];
+3. (2, np.inf];
+4. 96;
+5. 98.
+
+Такие сегменты сохранят примерный уровень разделения риска по сегментам и будут иметь логичный бизнес-смысл (нет, одна, больше 1).
+
+--- code cell ---
+segments = [1, 2, 17]
+
+--- markdown cell ---
+**Построим отчёт по полученным сегментам и итоговый график.**
+
+--- code cell ---
+num_90_days_late_segmented_data, num_90_days_late_report = make_segment_report_count_or_cat_feature(
+    data=data,
+    feature="num_90_days_late",
+    special_values=[96, 98],
+    segments=segments,
+    out_path="../data/risk_analysis/num_90_days_late/num_90_days_late_report.png"
+)
+
+--- code cell ---
+features_reports_names["num_90_days_late"] = "num_90_days_late_report"
+
+--- code cell ---
+plot_prebin_bad_rate_count_or_cat_feature(
+    data=data,
+    feature="num_90_days_late",
+    special_values=[96, 98],
+    segments=segments,
+    out_path="../data/risk_analysis/num_90_days_late/num_90_days_late_graphic.png"
+)
+
+--- code cell ---
+num_90_days_late_report
+
+--- markdown cell ---
+Большинство сегментов содержит достаточно наблюдений, вследствие чего доверительные интервалы bad rate сравнительно узкие и оценки имеют хорошую статистическую точность.
+
+Последний и предпоследний сегменты не объёмны, поэтому их оценка bad rate сильно теряет в точности. Тем не менее, данные сегменты необходимы исходя из бизнес логики (предположительно системные коды).
+
+--- markdown cell ---
+**Оценим статистическую значимость сегментирования.**
+
+--- code cell ---
+p_value, cramers_v = stat_power_segments(
+    segmented_data=num_90_days_late_segmented_data,
+    segment_col_name="num_90_days_late_segments",
+    target_feature="target"
+)
+
+--- code cell ---
+p_value, cramers_v
+
+--- code cell ---
+features_connects_powers["num_90_days_late"] = f"{p_value}; {cramers_v}"
+
+--- markdown cell ---
+Схема оценивания силы связи.
+
+--- code cell ---
+cramers_v_scheme
+
+--- markdown cell ---
+Распределение target статистически различается между сегментами `num_90_days_late` ($\chi^{2}$ test, p < 0.001).
+
+Cramer's V $\approx$ 0.35 указывает на заметную связь между сегментом num_90_days_late и target в исследуемой выборке.
+
+--- markdown cell ---
+**Вывод по признаку:**
+
+У `num_90_days_late` наблюдается выраженная нелинейная связь с будущей серьёзной просрочкой. У людей без среднесрочных просрочек bad rate находится ниже по датасету, после чего риск заметно возрастает. Сегмент 1-2 составляет около 4.5% датасета, но формирует ~25.3% всех bad events; его bad rate равен ~37.3%, что в 5.5 раза выше среднего. Далее bad rate растёт ещё сильнее, достигая ~61.6%, в диапазоне (2, 17], однако данный сегмент значительно меньше - около 0.85% датасета. Сегменты системных кодов имеют очень высокий bad rate ~80%, ~54% соответственно, но стоит учитывать малые объёмы сегментов, которые делают оценку bad rate в них крайне неточной.
+
+--- code cell ---
+risk_factor_notes.loc[ risk_factor_notes.shape[0] ] = [
+    "num_90_days_late",
+    "1. 0\n2. [1, 2]\n3. (2, 17]\n4. 96\n5. 98",
+    "1. [1, 2] || 4.5% || 25.3% || 37.3%\n"
+    "2. (2, 17] || 0.8% || 7.8% || 61.6%\n"
+    "3. 96 || 0% || 0.04% || 80.0%\n"
+    "4. 98 || 0.18% || 1.4% || 54.1%",
+    "1. 0 || 94.0% || 65.3% || 4.6%",
+    "Сегменты [1, 2] и (2, 17] являются очень сильными маркерами риска, пусть они и составляют примерно 5.4% датасета, "
+    "но формируют целых 33% всех bad events, а также имеют крайне высокий уровень риска (37.4%, 61.6% соответственно).",
+    "-",
+    p_value,
+    cramers_v
+]
+
+--- markdown cell ---
+### `debt_ratio`
+
+--- markdown cell ---
+**Построим график предварительных risk-сегментов.**
+
+--- code cell ---
+plot_prebin_bad_rate_continuos_feature(
+    data=data,
+    feature="debt_ratio"
+)
+
+--- markdown cell ---
+Предварительные сегменты стоит укрупнить. Выполнять это будем опираясь на бизнес-значения самих сегментов и структуру их bad rate.
+
+--- markdown cell ---
+**Выделим следующие сегменты:**
+1. [0.0, 0.1];
+2. (0.1, 0.7];
+3. (0.7, 1.0];
+4. (1.0, 4.0];
+5. (4.0, np.inf].
+
+Такие сегменты сохранят примерный уровень разделения риска по сегментам и будут иметь логичный бизнес-смысл (низкий, средний, высокий, экстремальные, огромные значения).
+
+--- code cell ---
+segments = [0.0, 0.1, 0.7, 1.0, 4.0, np.inf]
+
+--- markdown cell ---
+**Построим отчёт по полученным сегментам и итоговый график.**
+
+--- code cell ---
+debt_ratio_segmented_data, debt_ratio_report = make_segment_report_continuos_feature(
+    data=data,
+    feature="debt_ratio",
+    segments=segments,
+    out_path="../data/risk_analysis/debt_ratio/debt_ratio_report.png"
+)
+
+--- code cell ---
+features_reports_names["debt_ratio"] = "debt_ratio_report"
+
+--- code cell ---
+plot_prebin_bad_rate_continuos_feature(
+    data=data,
+    feature="debt_ratio",
+    segments=segments,
+    out_path="../data/risk_analysis/debt_ratio/debt_ratio_graphic.png"
+)
+
+--- code cell ---
+debt_ratio_report
+
+--- markdown cell ---
+Сегменты содержат достаточно наблюдений, вследствие чего доверительные интервалы bad rate сравнительно узкие и оценки имеют хорошую статистическую точность.
+
+--- markdown cell ---
+**Оценим статистическую значимость сегментирования.**
+
+--- code cell ---
+p_value, cramers_v = stat_power_segments(
+    segmented_data=debt_ratio_segmented_data,
+    segment_col_name="debt_ratio_segments",
+    target_feature="target"
+)
+
+--- code cell ---
+p_value, cramers_v
+
+--- code cell ---
+features_connects_powers["debt_ratio"] = f"{p_value}; {cramers_v}"
+
+--- markdown cell ---
+Схема оценивания силы связи.
+
+--- code cell ---
+cramers_v_scheme
+
+--- markdown cell ---
+Распределение target статистически различается между сегментами `debt_ratio` ($\chi^{2}$ test, p < 0.001).
+
+Cramer's V $\approx$ 0.06 указывает на очень слабую связь между сегментом debt_ratio и target в исследуемой выборке.
+
+--- markdown cell ---
+**Вывод по признаку:**
+
+У `debt_ratio` наблюдается очень слабая нелинейная связь с будущей серьёзной просрочкой. В диапазон до 0.7 bad rate находится около или ниже по датасету, но формируя при этом ~69% всех bad events, после чего риск возрастает. Сегмент 0.7-1.0 достигает значения bad rate ~11.1%, но составляя и формируя ~4.8% и ~8.1% датасета, bad rate соответственно. В сегменте 1.0-4.0 риск достигает своего пика ~12.1% bad tate, но стаставляет только ~3.5% датасета и формирует только ~6.3% всех bad events. В сегменте экстремальных значений >4.0 bad rate падает до ~5.5%, хотя составляет ~19.3% датасета и формируя при этом ~16.5% всех bad events.
+
+--- code cell ---
+risk_factor_notes.loc[ risk_factor_notes.shape[0] ] = [
+    "debt_ratio",
+    "1. [0.0, 0.1]\n2. (0.1, 0.7]\n3. (0.7, 1.0]\n4. (1.0, 4.0]\n5. (4.0, inf]",
+    "1. (0.7, 1.0] || 4.9% || 8.1% || 11.1%\n"
+    "2. (1.0, 4.0] || 3.5% || 6.3% || 12.1%",
+    "-",
+    "Сегменты (0.7, 1.0] и (1.0, 4.0] не являются сильными маркерами риска, по ним нельзя делать выводы.",
+    "Сегменты (0.7, 1.0] и (1.0, 4.0] не являются сильными маркерами, но их можно попробовать в "
+    "качестве дополнительных условий в interaction analysis.",
+    p_value,
+    cramers_v
+]
+
+--- markdown cell ---
+### `monthly_income`
+
+--- markdown cell ---
+**Построим график предварительных risk-сегментов.**
+
+--- code cell ---
+plot_prebin_bad_rate_continuos_feature(
+    data=data,
+    feature="monthly_income",
+    special_values=[np.nan]
+)
+
+--- markdown cell ---
+Предварительные сегменты стоит укрупнить. Выполнять это будем опираясь на бизнес-значения самих сегментов и структуру их bad rate.
+
+--- markdown cell ---
+**Выделим следующие сегменты:**
+1. [0.0, 900.0];
+2. (900.0, 3000.0];
+3. (3000.0, 4500.0];
+4. (4500.0, 6500.0];
+5. (6500.0, 13000.0];
+6. (13000.0, np.inf];
+7. Nan.
+
+Такие сегменты сохранят примерный уровень разделения риска по сегментам и будут иметь логичный бизнес-смысл (низкий, средний, высокий, экстремальные, огромные значения).
+
+--- code cell ---
+segments = [0.0, 900.0, 3000.0, 4500.0, 6500.0, 13000.0, np.inf]
+
+--- markdown cell ---
+**Построим отчёт по полученным сегментам и итоговый график.**
+
+--- code cell ---
+monthly_income_segmented_data, monthly_income_report = make_segment_report_continuos_feature(
+    data=data,
+    feature="monthly_income",
+    segments=segments,
+    special_values=[np.nan],
+    out_path="../data/risk_analysis/monthly_income/monthly_income_report.png"
+)
+
+--- code cell ---
+features_reports_names["monthly_income"] = "monthly_income_report"
+
+--- code cell ---
+plot_prebin_bad_rate_continuos_feature(
+    data=data,
+    feature="monthly_income",
+    segments=segments,
+    special_values=[np.nan],
+    out_path="../data/risk_analysis/monthly_income/monthly_income_graphic.png"
+)
+
+--- code cell ---
+monthly_income_report
+
+--- markdown cell ---
+Сегменты содержат достаточно наблюдений, вследствие чего доверительные интервалы bad rate сравнительно узкие и оценки имеют хорошую статистическую точность.
+
+--- markdown cell ---
+**Оценим статистическую значимость сегментирования.**
+
+--- code cell ---
+p_value, cramers_v = stat_power_segments(
+    segmented_data=monthly_income_segmented_data,
+    segment_col_name="monthly_income_segments",
+    target_feature="target"
+)
+
+--- code cell ---
+p_value, cramers_v
+
+--- code cell ---
+features_connects_powers["monthly_income"] = f"{p_value}; {cramers_v}"
+
+--- markdown cell ---
+Схема оценивания силы связи.
+
+--- code cell ---
+cramers_v_scheme
+
+--- markdown cell ---
+Распределение target статистически различается между сегментами `monthly_income` ($\chi^{2}$ test, p < 0.001).
+
+Cramer's V $\approx$ 0.073 указывает на очень слабую связь между сегментом monthly_income и target в исследуемой выборке.
+
+--- markdown cell ---
+**Вывод по признаку:**
+
+У `monthly_income` наблюдается очень слабая нелинейная связь с будущей серьёзной просрочкой. В диапазон до 900 bad rate находится ниже по датасету, сам сегмент небольшой - ~2.8% датасета и ~2% всех bad events. В следующих сегментах (900-6500) риск возрастает. Сегменты 900-6500 имеют несколько повышенный риск - bad rate от ~7% до ~10.0%, при этом данные сегменты составляют ~46.8% (от 13 до 17 процентов на сегмент) и формируют ~58.8% всех bad events (от 18 до 20 процентов на сегмент). В следующих сегментах риск снижается, падая до ~4.6% (~5%, ~4.6%, ~5.6% соответственно), составляя при этом ~50% датасета и формируя ~39% всех bad events.
+
+--- code cell ---
+risk_factor_notes.loc[ risk_factor_notes.shape[0] ] = [
+    "monthly_income",
+    "1. [0.0, 900.0]\n2. (900.0, 3000.0]\n3. (3000.0, 4500.0]\n4. (4500.0, 6500.0]\n5. (6500.0, 13000.0]\n6. (13000.0, inf]\n7. NaN",
+    "1. (900.0, 3000.0] || 13.9% || 20.7% || 10.0%\n"
+    "2. (3000.0, 4500.0] || 15.1% || 19.6% || 8.6%",
+    "-",
+    "Сегменты (900.0, 3000.0] и (3000.0, 4500.0] можно принять за слабые маркеры. В совокупности они составляют "
+    "примерно 30% датасета и формируют 40% всех bad events, но тем не менее bad rate у них не высок.",
+    "Сегменты (900.0, 3000.0] и (3000.0, 4500.0] можно сужать и уточнять, так как они занимают 30% датасета "
+    "и формируют 40% всех bad events, но имеют bad rate всего порядка 9%.",
+    p_value,
+    cramers_v
+]
+
+--- markdown cell ---
+### `num_open_credit_lines`
+
+--- markdown cell ---
+**Построим график предварительных risk-сегментов.**
+
+--- code cell ---
+plot_prebin_bad_rate_count_or_cat_feature(
+    data=data,
+    feature="num_open_credit_lines"
+)
+
+--- markdown cell ---
+Предварительные сегменты стоит укрупнить. Выполнять это будем опираясь на бизнес-значения самих сегментов и структуру их bad rate.
+
+--- markdown cell ---
+**Выделим следующие сегменты:**
+1. 0;
+2. [1, 2];
+3. (2, np.inf].
+
+Такие сегменты сохранят примерный уровень разделения риска по сегментам и будут иметь логичный бизнес-смысл (нет, одна, больше 1).
+
+--- code cell ---
+segments = [1, 2, 58]
+
+--- markdown cell ---
+**Построим отчёт по полученным сегментам и итоговый график.**
+
+--- code cell ---
+num_open_credit_lines_segmented_data, num_open_credit_lines_report = make_segment_report_count_or_cat_feature(
+    data=data,
+    feature="num_open_credit_lines",
+    segments=segments,
+    out_path="../data/risk_analysis/num_open_credit_lines/num_open_credit_lines_report.png"
+)
+
+--- code cell ---
+features_reports_names["num_open_credit_lines"] = "num_open_credit_lines_report"
+
+--- code cell ---
+plot_prebin_bad_rate_count_or_cat_feature(
+    data=data,
+    feature="num_open_credit_lines",
+    segments=segments,
+    out_path="../data/risk_analysis/num_open_credit_lines/num_open_credit_lines_graphic.png"
+)
+
+--- code cell ---
+num_open_credit_lines_report
+
+--- markdown cell ---
+Сегменты содержат достаточно наблюдений, вследствие чего доверительные интервалы bad rate сравнительно узкие и оценки имеют хорошую статистическую точность.
+
+--- markdown cell ---
+**Оценим статистическую значимость сегментирования.**
+
+--- code cell ---
+p_value, cramers_v = stat_power_segments(
+    segmented_data=num_open_credit_lines_segmented_data,
+    segment_col_name="num_open_credit_lines_segments",
+    target_feature="target"
+)
+
+--- code cell ---
+p_value, cramers_v
+
+--- code cell ---
+features_connects_powers["num_open_credit_lines"] = f"{p_value}; {cramers_v}"
+
+--- markdown cell ---
+Схема оценивания силы связи.
+
+--- code cell ---
+cramers_v_scheme
+
+--- markdown cell ---
+Распределение target статистически различается между сегментами `num_open_credit_lines` ($\chi^{2}$ test, p < 0.001).
+
+Cramer's V $\approx$ 0.1 указывает на слабую связь между сегментом num_open_credit_lines и target в исследуемой выборке.
+
+--- markdown cell ---
+**Вывод по признаку:**
+
+У `num_open_credit_lines` наблюдается выраженная нелинейная связь с будущей серьёзной просрочкой. Люди, не имевшие на момент скоринга кредитов, имеют риск значительно выше - в 3.83 раза bad rate выше среднего по датасету, однако сам сегмент составляет всего ~1.26% всего датасета и формирует всего ~4.8% всех bad events. В сегменте 1-2 риск значительно снижается до bad rate ~10.7% против ~6.8% в среднем по датасету, сегмент составляет ~7.4% всего датасета и формирует ~11.9% всех bad events. В последнем сегменте (2-58) bad rate располагается уже около среднего по датасету - ~6%, но составляет при этом ~91.3% всего датасета и формирует ~83.2%.
+
+--- code cell ---
+risk_factor_notes.loc[ risk_factor_notes.shape[0] ] = [
+    "num_open_credit_lines",
+    "1. 0\n2. [1, 2]\n3. (2, 58]",
+    "1. 0 || 1.2% || 4.8% || 25.6%\n"
+    "2. (1, 2] || 7.4% || 11.9% || 10.7%",
+    "-",
+    "Сегменты 0 и (1, 2] можно принять за маркеры. Пусть сегмент 0 имеет высокий bad rate - 25.6%, но за сильный "
+    "маркер мешает его принять его малый объём - 1.3% датасета. Второй сегмент имеет не сильно высокий bad rate "
+    "- 10.7%.",
+    "Сегмент 0 можно принять за дополнительно условие для сужение других сегментов. "
+    "Сегмент (1, 2] можно пытаться сужать дополнителльными условиями, так как его объём 7.4% датасета и 11.9% всех "
+    "bad events это позволяет.",
+    p_value,
+    cramers_v
+]
+
+--- markdown cell ---
+### `num_real_estate_loans`
+
+--- markdown cell ---
+**Построим график предварительных risk-сегментов.**
+
+--- code cell ---
+plot_prebin_bad_rate_count_or_cat_feature(
+    data=data,
+    feature="num_real_estate_loans"
+)
+
+--- markdown cell ---
+Предварительные сегменты стоит укрупнить. Выполнять это будем опираясь на бизнес-значения самих сегментов и структуру их bad rate.
+
+--- markdown cell ---
+**Выделим следующие сегменты:**
+1. 0;
+2. [1, 3];
+3. (3, 54].
+
+Такие сегменты сохранят примерный уровень разделения риска по сегментам и будут иметь логичный бизнес-смысл (нет, одна, больше 1).
+
+--- code cell ---
+segments = [1, 3, 54]
+
+--- markdown cell ---
+**Построим отчёт по полученным сегментам и итоговый график.**
+
+--- code cell ---
+num_real_estate_loans_segmented_data, num_real_estate_loans_report = make_segment_report_count_or_cat_feature(
+    data=data,
+    feature="num_real_estate_loans",
+    segments=segments,
+    out_path="../data/risk_analysis/num_real_estate_loans/num_real_estate_loans_report.png"
+)
+
+--- code cell ---
+features_reports_names["num_real_estate_loans"] = "num_real_estate_loans_report"
+
+--- code cell ---
+plot_prebin_bad_rate_count_or_cat_feature(
+    data=data,
+    feature="num_real_estate_loans",
+    segments=segments,
+    out_path="../data/risk_analysis/num_real_estate_loans/num_real_estate_loans_graphic.png"
+)
+
+--- code cell ---
+num_real_estate_loans_report
+
+--- markdown cell ---
+Большинство сегментов содержит достаточно наблюдений, вследствие чего доверительные интервалы bad rate сравнительно узкие и оценки имеют хорошую статистическую точность.
+
+Последний сегмент не объёмен, поэтому его оценка bad rate сильно теряет в точности.
+
+--- markdown cell ---
+**Оценим статистическую значимость сегментирования.**
+
+--- code cell ---
+p_value, cramers_v = stat_power_segments(
+    segmented_data=num_real_estate_loans_segmented_data,
+    segment_col_name="num_real_estate_loans_segments",
+    target_feature="target"
+)
+
+--- code cell ---
+p_value, cramers_v
+
+--- code cell ---
+features_connects_powers["num_real_estate_loans"] = f"{p_value}; {cramers_v}"
+
+--- markdown cell ---
+Схема оценивания силы связи.
+
+--- code cell ---
+cramers_v_scheme
+
+--- markdown cell ---
+Распределение target статистически различается между сегментами `num_real_estate_loans` ($\chi^{2}$ test, p < 0.001).
+
+Cramer's V $\approx$ 0.06 указывает на слабо выраженную связь между сегментом num_real_estate_loans и target в исследуемой выборке.
+
+--- markdown cell ---
+**Вывод по признаку:**
+
+У `num_real_estate_loans` наблюдается слабо выраженная нелинейная связь с будущей серьёзной просрочкой. Люди, не имевшие на момент скоринга кридитов, имеют риск несколько выше - в 1.24 раза bad rate выше среднего по датасету, сам сегмент составляет ~37.4% всего датасета и формирует целых ~46.6% всех bad events. В сегменте 1-3 риск незначительно снижается до bad rate ~5.4% против ~6.8% в среднем по датасету, сегмент составляет целых ~60.1% всего датасета и формирует целых ~49.2% всех bad events. В последнем сегменте (3-54) bad rate значительно возрастает, достигая ~11.4%, но сам сегмент составляет всего ~2.4% всего датасета и формирует всего ~4.1%.
+
+--- code cell ---
+risk_factor_notes.loc[ risk_factor_notes.shape[0] ] = [
+    "num_real_estate_loans",
+    "1. 0\n2. [1, 3]\n3. (3, 54]",
+    "1. (3, 54] || 2.4% || 4.2% || 11.4%",
+    "-",
+    "Сегмент (3, 54] нельзя принять за маркер, так как он не обладает для этого ни объёмом (2.4% всего датасета), "
+    "ни высоким bad rate (11.4%)",
+    "Сегмент (3, 54] можно принять за дополнительно условие для сужения других сегментов.",
+    p_value,
+    cramers_v
+]
+
+--- markdown cell ---
+### `num_dependents`
+
+--- markdown cell ---
+**Построим график предварительных risk-сегментов.**
+
+--- code cell ---
+plot_prebin_bad_rate_count_or_cat_feature(
+    data=data,
+    feature="num_dependents",
+    special_values=[np.nan]
+)
+
+--- markdown cell ---
+Предварительные сегменты стоит укрупнить. Выполнять это будем опираясь на бизнес-значения самих сегментов и структуру их bad rate.
+
+--- markdown cell ---
+**Выделим следующие сегменты:**
+1. 0;
+2. [1, 2];
+3. (2, np.inf];
+4. Nan.
+
+Такие сегменты сохранят примерный уровень разделения риска по сегментам и будут иметь логичный бизнес-смысл (нет, одна, больше 1).
+
+--- code cell ---
+segments = [1, 2, 20]
+
+--- markdown cell ---
+**Построим отчёт по полученным сегментам и итоговый график.**
+
+--- code cell ---
+num_dependents_segmented_data, num_dependents_report = make_segment_report_count_or_cat_feature(
+    data=data,
+    feature="num_dependents",
+    segments=segments,
+    special_values=[np.nan],
+    out_path="../data/risk_analysis/num_dependents/num_dependents_report.png"
+)
+
+--- code cell ---
+features_reports_names["num_dependents"] = "num_dependents_report"
+
+--- code cell ---
+plot_prebin_bad_rate_count_or_cat_feature(
+    data=data,
+    feature="num_dependents",
+    segments=segments,
+    special_values=[np.nan],
+    out_path="../data/risk_analysis/num_dependents/num_dependents_graphic.png"
+)
+
+--- code cell ---
+num_dependents_report
+
+--- markdown cell ---
+Большинство сегментов содержит достаточно наблюдений, вследствие чего доверительные интервалы bad rate сравнительно узкие и оценки имеют хорошую статистическую точность.
+
+--- markdown cell ---
+**Оценим статистическую значимость сегментирования.**
+
+--- code cell ---
+p_value, cramers_v = stat_power_segments(
+    segmented_data=num_dependents_segmented_data,
+    segment_col_name="num_dependents_segments",
+    target_feature="target"
+)
+
+--- code cell ---
+p_value, cramers_v
+
+--- code cell ---
+features_connects_powers["num_dependents"] = f"{p_value}; {cramers_v}"
+
+--- markdown cell ---
+Схема оценивания силы связи.
+
+--- code cell ---
+cramers_v_scheme
+
+--- markdown cell ---
+Распределение target статистически различается между сегментами `num_dependents` ($\chi^{2}$ test, p < 0.001).
+
+Cramer's V $\approx$ 0.04 указывает на очень слабую связь между сегментом num_dependents и target в исследуемой выборке.
+
+--- markdown cell ---
+**Вывод по признаку:**
+
+У `num_dependents` не наблюдается выраженной связи с будущей серьёзной просрочкой. Люди, не имеющие иждевенцев в семье имеют риск несколько ниже - bad rate ~5.8% (57.9% всего датасета и 50.8% всех bad events). Средние сегменты 1-2 и 2-20 имеют несколько повышенный риск, увеличивается в 1.14-1.38 раза по сравнению со средним bad rate, сам сегменты составляют примерно 32% датасета и формируют ~47% всех bad events. Сегмент Nan имеет сниженный риск - в 1.46 раза, но составляет всего ~2.6% всего датасета.
+
+--- code cell ---
+risk_factor_notes.loc[ risk_factor_notes.shape[0] ] = [
+    "num_dependents",
+    "1. 0\n2. [1, 2]\n3. (2, 20]\n4. Nan",
+    "-",
+    "1. Nan || 2.6% || 1.8% || 4.56%",
+    "-",
+    "-",
+    p_value,
+    cramers_v
+]
+
+--- markdown cell ---
+### Risk Factor Notes
+
+--- code cell ---
+risk_factor_notes = (
+    risk_factor_notes
+    .style
+    .set_properties(
+        **{
+            "text-align": "left",
+            "white-space": "pre-wrap"
+        }
+    )
+    .set_table_styles(
+        [{
+            "selector": "th.col_heading",
+            "props": [("text-align", "center")]
+        }]
+    )
+)
+
+--- markdown cell ---
+## Risk Factor Summary
+
+--- markdown cell ---
+**Выведем сформированные во время анализа заметки.**
+
+--- code cell ---
+risk_factor_notes
+
+--- markdown cell ---
+**Сформируем по заданной заметке сформируем итоговую результирующую таблицу.**
+
+--- code cell ---
+risk_factor_summary = pd.DataFrame({
+    "Feature": [
+        "Revolving utilization",
+        "Age",
+        "30-59 DPD",
+        "60-89 DPD",
+        "90+ DPD",
+        "Debt ratio",
+        "Income",
+        "Open credit lines",
+        "Real-estate loans",
+        "Dependents"
+    ],
+    "Cramer's V": [0.303, 0.113, 0.278, 0.282, 0.350, 0.062, 0.073, 0.099, 0.062, 0.047],
+    "Main pattern": [
+        "Сильная нелинейная градация уровня риска между сегментами." ,
+        "Риск в среднем в 1.57% раза выше у молодых людей - (22-45] лет.",
+        "Риск быстро возрастает у людей, имеющих просрочки.",
+        "Риск быстро возрастает у людей, имеющих просрочки. Сильная градация риска между сегментами.",
+        "Риск быстро возрастает у людей, имеющих просрочки. Сильная градация риска между сегментами.",
+        "Риск возрастает у людей с высоким Ratio - (0.7-4.0].",
+        "У людей с низким-средним доходом ((900-4500]) несколько выше - 1.39 раза в среднем.",
+        "Высокий риск у людей, не имевших кредитов на момент скоринга.",
+        "Слабая нелинейная связь.",
+        "Слабая нелинейная связь."
+    ],
+    "Main risk segments": [
+        "(0.7, 1.0]\n(1.0, 2.0]",
+        "(22.0, 30.0]\n(30.0, 45.0]",
+        "[1, 2]\n(2, 13]",
+        "[1, 2]\n(2, 11]",
+        "[1, 2]\n(2, 17]",
+        "(0.7, 1.0]\n(1.0, 4.0]",
+        "(900.0, 3000.0]\n(3000.0, 4500.0]",
+        "0",
+        "0",
+        "(2, 20]"
+    ],
+    "Dataset share": [
+        "17.75\n1.97", 
+        "6.67\n23.03",
+        "13.75\n2.05",
+        "4.57\n0.32",
+        "4.53\n0.85",
+        "4.89\n3.50",
+        "13.92\n15.17",
+        "1.26",
+        "37.46",
+        "8.89"
+    ],
+    "Bad share" : [
+        "47.05\n11.80",
+        "11.92\n37.65",
+        "36.19\n12.07",
+        "23.32\n2.84",
+        "25.34\n7.82",
+        "8.17\n6.36",
+        "20.73\n19.58",
+        "4.83",
+        "46.6",
+        "12.30"
+    ],
+    "BR": [
+        "17.72\n40.10",
+        "11.79\n9.31",
+        "17.59\n39.26",
+        "34.14\n58.64",
+        "37.38\n61.68",
+        "11.15\n12.16",
+        "9.95\n8.63",
+        "25.64",
+        "8.31",
+        "9.25"
+    ],
+    "Lift": [
+        "2.65\n5.99",
+        "1.76\n1.39",
+        "2.63\n5.87",
+        "5.11\n8.77",
+        "5.59\n9.23",
+        "1.67\n1.82",
+        "1.49\n1.29",
+        "3.84",
+        "1.24",
+        "1.38"
+    ],
+    "Dataset relevance": [
+        "Very\nHigh",
+        "Very\nNormal",
+        "Very\nHigh",
+        "High",
+        "High",
+        "Very\nNormal",
+        "Normal",
+        "Low",
+        "Normal",
+        "Low"
+    ],
+    "Dataset relevance num": [
+        5, 3, 5, 4, 4, 3, 2, 1, 2, 1
+    ]
+})
+
+risk_factor_summary = (
+    risk_factor_summary
+    .sort_values(by="Dataset relevance num", ascending=False)
+    .drop(columns="Dataset relevance num")
+)
+risk_factor_summary = (
+    risk_factor_summary
+    .style
+    .set_properties(
+        **{
+            "text-align": "left",
+            "white-space": "pre-wrap"
+        }
+    )
+    .set_table_styles(
+        [{
+            "selector": "th.col_heading",
+            "props": [("text-align", "center")]
+        }]
+    )
+)
+
+--- code cell ---
+navigation["risk factor summary"] = "risk_factor_summary"
+
+--- code cell ---
+risk_factor_summary
+
+--- markdown cell ---
+## Cross-Segment Risk Analysis
+
+--- markdown cell ---
+### Pairwise Segment Search
+
+--- markdown cell ---
+Выполним предварительный поиск "интересных" пересечений сегментов. Будем считать пересечение интересным, если:
+1. Размер сегмента будет превосходить 0.5% исходного датасета;
+2. Будет в себе содержать не менее 1% всех bad events;
+3. Его Bad Rate будет выше, чем Bad Rate любого из родителей.
+
+--- code cell ---
+features_segmented_datas = [
+    revolving_utilization_segmented_data,
+    age_segmented_data,
+    num_30_59_days_late_segmented_data,
+    num_60_89_days_late_segmented_data,
+    num_90_days_late_segmented_data,
+    debt_ratio_segmented_data,
+    monthly_income_segmented_data,
+    num_open_credit_lines_segmented_data,
+    num_real_estate_loans_segmented_data,
+    num_dependents_segmented_data
+]
+
+features = [
+    "revolving_utilization",
+    "age",
+    "num_30_59_days_late",
+    "num_60_89_days_late",
+    "num_90_days_late",
+    "debt_ratio",
+    "monthly_income",
+    "num_open_credit_lines",
+    "num_real_estate_loans",
+    "num_dependents"
+]
+
+segments = [
+    feature_segmented_data[f"{feature}_segments"].unique().tolist()
+    for feature, feature_segmented_data in zip(
+        features,
+        features_segmented_datas
+    )
+]
+
+dataset_size = data.shape[0]
+dataset_num_bad_events = data["target"].sum()
+dataset_bad_rate = data["target"].mean()
+
+--- code cell ---
+pairwise_report = make_pairwise_segments_analysis(
+    features_segmented_datas=features_segmented_datas,
+    features=features,
+    segments=segments,
+    dataset_size=dataset_size,
+    dataset_num_bad_events=dataset_num_bad_events,
+    dataset_bad_rate=dataset_bad_rate
+)
+
+--- code cell ---
+navigation["pairwise report"] = "pairwise_report"
+
+--- code cell ---
+pretty_pairwise_report = make_prettier_pairwise_report(
+    pairwise_report=pairwise_report,
+    dataset_size=dataset_size,
+    dataset_share_threshold=0.005,
+    dataset_num_bad_events=dataset_num_bad_events,
+    bad_share_threshold=0.01)
+
+--- code cell ---
+navigation["pretty pairwise report"] = "pretty_pairwise_report"
+
+--- code cell ---
+(
+    pretty_pairwise_report.sample(10)
+    .style
+    .set_properties(
+        **{
+            "text-align": "left",
+            "white-space": "pre-wrap"
+        }
+    )
+    .set_table_styles(
+        [{
+            "selector": "th.col_heading",
+            "props": [("text-align", "center")]
+        }]
+    )
+)
+
+--- markdown cell ---
+### Risk Concentration
+
+--- markdown cell ---
+Выявим пересечения сегментов имеющих наибольший риск.
+
+--- code cell ---
+(
+    pretty_pairwise_report
+    .sort_values(by="Bad Rate", ascending=False)
+    .reset_index(drop=True)
+    .head(20)
+    .style
+    .set_properties(
+        **{
+            "text-align": "left",
+            "white-space": "pre-wrap"
+        }
+    )
+    .set_table_styles(
+        [{
+            "selector": "th.col_heading",
+            "props": [("text-align", "center")]
+        }]
+    )
+)
+
+--- markdown cell ---
+**Вывод по risk concantration:**
+1. 85% топ 20 по BR пересечений используют DPD:
+    1. 45% 90+ DPD;
+    2. 35% 30-59 DPD;
+    3. 20% 60-89 DPD.
+    
+    Данные признаки имеют стартовый высокий BR, поэтому весьма логично, что сегменты с ними обладают высоким BR;
+2. 40% топ 20% по BR пересечений используют Revolving Utilization. Данный признак сам обладает высоким базовым BR, и его дополнительно позволяют повысить признаки:
+    1. age;
+    2. num_dependents;
+    3. num_open_credit_lines.
+
+    Кроме того, данный признак хорошо выступает в коллаборации с другим мощными маркерами: 30-59, 60-89, 90+ DPD.
+3. Признаки **num_open_credit_lines**, **age**, **num_real_estate_loans**, **num_dependents**, **num_open_credit_lines**, **monthly_income** выступают как дополнительные маркеры, либо повышающие эффективность мощных маркеров (пп. 1-2), либо выступающие как базовые сегменты для сужения мощными маркерами.
+
+--- code cell ---
+summary_table = (
+    pretty_pairwise_report
+    .sort_values(by="Bad Rate", ascending=False)
+    .reset_index(drop=True)
+    .head(20)
+    .iloc[[0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 15, 16, 17, 19], :]
+).reset_index(drop=True)
+
+--- markdown cell ---
+### Dataset Impact
+
+--- markdown cell ---
+Выявим сегменты, содержащие максимальное количество Bad Events
+
+--- code cell ---
+(
+    pretty_pairwise_report
+    .sort_values(by="Bad Events", ascending=False)
+    .reset_index(drop=True)
+    .head(20)
+    .style
+    .set_properties(
+        **{
+            "text-align": "left",
+            "white-space": "pre-wrap"
+        }
+    )
+    .set_table_styles(
+        [{
+            "selector": "th.col_heading",
+            "props": [("text-align", "center")]
+        }]
+    )
+)
+
+--- markdown cell ---
+**Вывод по Dataset Impact:**
+
+Перечислю перспективные пересечения признаков:
+1. **revolving_utilization (0.7, 1.0]** & **num_real_estate_loans 0** row 0;
+2. **num_90_days_late [1, 2]** & **num_open_credit_lines (2, 58]** row 2;
+3. **revolving_utilization (0.7, 1.0]** & **age (30.0, 45.0]** row 3;
+4. **revolving_utilization (0.7, 1.0]** & **num_30_59_days_late [1, 2]** row 5;
+5. **num_30_59_days_late [1, 2]** & **num_real_estate_loans 0** row 6;
+6. **revolving_utilization (0.7, 1.0]** & **num_90_days_late [1, 2]** row 10;
+7. **age (30.0, 45.0]** & **num_30_59_days_late [1, 2]** row 13;
+8. **num_90_days_late [1, 2]** & **debt_ratio (0.1, 0.7]** row 14;
+9. **revolving_utilization (0.7, 1.0]** & **num_60_89_days_late [1, 2]** row 18;
+
+Данные комбинации признаков содержат не менее 11% всех bad events. Кроме того, данные сегменты имеют повышенные BR и Delta BR не менее 3%, что в совокупности делает данные сегменты перспективными.
+
+--- code cell ---
+summary_table = pd.concat(
+    [
+        summary_table,
+        pretty_pairwise_report
+        .sort_values(by="Bad Events", ascending=False)
+        .reset_index(drop=True)
+        .head(20)
+        .iloc[[0, 2, 3, 5, 6, 10, 13, 14, 18], :]
+    ],
+    axis=0
+).reset_index(drop=True)
+
+--- markdown cell ---
+### Incremental Risk Concentration
+
+--- markdown cell ---
+Выявим комбинации признаков, которые дают наибольший прирост BR.
+
+--- code cell ---
+(
+    pretty_pairwise_report
+    .sort_values(by="Delta Bad Rate", ascending=False)
+    .reset_index(drop=True)
+    .head(20)
+    .style
+    .set_properties(
+        **{
+            "text-align": "left",
+            "white-space": "pre-wrap"
+        }
+    )
+    .set_table_styles(
+        [{
+            "selector": "th.col_heading",
+            "props": [("text-align", "center")]
+        }]
+    )
+)
+
+--- markdown cell ---
+**Вывод по Incremental Risk Concentration:**
+1. Комбинации мощных изначальных признаков и их сегментов дают очень большой прирост:
+    1. **revolving_utilization** & **DPD**: avg risk delta ~7.86%;
+    2. **DPD** & **DPD**: avg risk delta ~13.2%.
+2. Комбинации мощных признаков и вспомогательных (самих по себе, не обладающих высоким Bad Rate) дают ощутимый прирост:
+    1. **num_open_credit_lines** & **DPD**: avg risk delta ~10.4%;
+    2. **debt_ratio** & **DPD** | **num_open_credit_lines** | **revolving_utilization**: avg risk delta ~6%;
+    3. **age** & **DPD**: avg risk delta ~6%;
+    4. **num_dependents** & **DPD**: avg risk delta ~5.3%.
+3. Комбинации изначально слабых признаков (самих по себе, не обладающих высоким Bad Rate) дают ощутимый прирост, но всё равно не обладают высоким bad rate:
+    1. **montlhy_income** & **num_dependents**: avg risk delta ~6.2%;
+    2. **num_open_credit_lines** & **debt_ratio** | age: avg risk delta ~5.8%;
+    3. **num_real_estate_loans** & **num_dependents**: avg risk delta ~5.7%.
+
+--- code cell ---
+summary_table = pd.concat(
+    [
+        summary_table,
+        pretty_pairwise_report
+        .sort_values(by="Delta Bad Rate", ascending=False)
+        .reset_index(drop=True)
+        .head(20)
+        .iloc[[0, 1, 2, 3, 4, 5, 6, 7, 12, 15, 16, 17, 18, 19], :]
+    ],
+    axis=0
+).reset_index(drop=True)
+
+summary_table = summary_table.drop_duplicates()
+
+--- markdown cell ---
+## Cross-Segment Risk Analysis Summary
+
+--- markdown cell ---
+Выведем сформированную таблицу сегментов признаков.
+
+--- code cell ---
+(
+    summary_table
+    .style
+    .set_properties(
+        **{
+            "text-align": "left",
+            "white-space": "pre-wrap"
+        }
+    )
+    .set_table_styles(
+        [{
+            "selector": "th.col_heading",
+            "props": [("text-align", "center")]
+        }]
+    )
+)
+
+--- markdown cell ---
+Выберем среди них наиболее перспективные и обоснуем этот выбор:
+
+--- code cell ---
+cross_segment_risk_analysis_summary = (
+    summary_table
+    .iloc[
+        [1, 2, 3, 4, 5, 6, 7, 9, 17, 18, 21, 22, 25, 26, 27],
+        [0, 1, 2, 5, 7, 8, 11, 12]
+    ]
+    .reset_index(drop=True)
+)
+
+--- code cell ---
+cross_segment_risk_analysis_summary["Explanations"] = [
+    "Очень высокий BR + огромное его повышение",
+    "Очень высокий BR + огромное его повышение",
+    "Очень высокий BR + огромное его повышение",
+    "Очень высокий BR + огромное его повышение + хороший объём",
+    "Очень высокий BR + неплохое его повышение",
+    "Очень высокий BR + неплохое его повышение",
+    "Очень высокий BR + неплохое его повышение",
+    "Очень высокий BR + неплохое его повышение + хороший объём",
+    "Очень большое повышение BR + очень значительный Bad Share",
+    "Высокий Bad Rate + очень значительный Bad Share",
+    "Очень высокий BR + очень большое повышение BR + хороший объём",
+    "Высокий Bad Rate + огромное его повышение",
+    "Высокий Bad Rate + значительное его повышение + хороший объём",
+    "Очень высокий BR + значительное его повышение",
+    "Высокий Bad Rate + значительное его повышение"
+]
+
+--- code cell ---
+(
+    cross_segment_risk_analysis_summary
+    .style
+    .set_properties(
+        **{
+            "text-align": "left",
+            "white-space": "pre-wrap"
+        }
+    )
+    .set_table_styles(
+        [{
+            "selector": "th.col_heading",
+            "props": [("text-align", "center")]
+        }]
+    )
+)
+
+--- code cell ---
+navigation["cross segment risk analysis summary"] = '(cross_segment_risk_analysis_summary.style.set_properties(**{"text-align": "left", "white-space": "pre-wrap"}).set_table_styles([{"selector": "th.col_heading", "props": [("text-align", "center")]}]))'
+
+--- markdown cell ---
+Таким образом, наиболее перспективными оказались комбинации:
+1. Сильных признаков с сильными признаками (**revolving_utilization**, **DPD**, **num_real_estate_loans**);
+2. Сильных признаков с слабыми признаками (**revolving_utilization**, **DPD** & **age**, **debt_ratio**, **monthly_income**, **num_open_credit_lines**).
+
+--- markdown cell ---
+## Key Findings
+
+--- markdown cell ---
+**1. Какие характеристики сильнее всего связаны с bad rate?**
+
+--- markdown cell ---
+Наибольшую связь с риском имеют признаки:
+1. **Revolving Utilization**. Ключевые сегменты риска формируют ~59% всех bad events, обладая при этом очень высоким bad rate;
+2. **30-59 DPD**, **60-89 DPD**, **90+ DPD**. Ключевые сегменты риска признаков формируют значительную часть всех bad events - ~26-48% при этом имеют рекордные bad rate среди всех признаков.
+
+Остальные характеристики пусть и имеют сегменты с выраженным BR, но тем не менее им либо не хватает уровня bad rate, либо не хватает уровней dataset share / bad share, то есть они не обладают выраженной статистической значимостью.
+
+--- markdown cell ---
+**2. Какие рискованные сегменты достаточно велики, чтобы существенно влиять на качество всего порфеля?**
+
+--- markdown cell ---
+К таким сегментам относятся:
+1. Высокий и экстремальный **Revolving utilization** - (0.7, 2.0]. Данный сегмент формирует ~59 bad events и при этом имеет bad rate не менее ~17%, таким образом имея огромное влияние на качество всего портфеля;
+2. Положительные **30-59 DPD**, **60-89 DPD**, **90+ DPD**. Данные сегменты перечисленных признаков пусть и занимают заметно меньшую долю датасета, но формируют при этом от ~26 до ~48% всех bad events (при dataset share от ~5% до ~15%). То есть их влияние на качество огромно;
+3. Сегменты молодого и среднего **возраста** - (22.0, 45.0] тоже имеют значительное влияние, так как формируют порядка ~49% всех bad events при не большом объёме ~26%.
+4. Сегменты низкого и среднего **ежемесячного дохода** - (900.0 - 4500] тоже имеют огромное влияние, так как формируют ~40% всех bad events при сравнительно не большом объёме - dataset share ~29%.
+
+Остальные сегменты признаков либо не располагают выдающимися объёмами bad events, либо достаточным bad rate.
+
+--- markdown cell ---
+**3. Какие характеристики дают выраженный risk gradient?**
+
+--- markdown cell ---
+Значимый risk gradient имеют следующие характеристики:
+1. **Revolving utilization** - максимальный разброс ~38.1% между сегментами;
+2. **30-59 DPD** - максимальный разброс ~35.2% между сегментами;
+3. **60-89 DPD** - максимальный разброс ~53.5% между сегментами;
+4. **90+ DPD** - максимальный разброс ~57.0% между сегментами.
+
+У остальных признаков градиент не столь явно выражен, как у приведённых признаков.
+
+--- markdown cell ---
+**4. Какие сочетания характеристик особенно рискованы?**
+
+--- markdown cell ---
+Наиболее рискованными являются следующие сочетания характеристик:
+1. Экстремальные значения **Revolving utilization** ((1.0, 2.0]) в сочетании с **наличием просрочек**. Такие сочетания обладают средним BR порядка 43.4%;
+2. **Наличие 2 категорий просрочек**. Такие сочетания обладают средним BR порядка 49.5%;
+3. Сочетание наличия **коротких просрочек** и **среднего возраста** - (30.0 - 45.0] также дают высокий риск, порядка 44%.
+
+Другие сочетания характеристик имеют заметно меньшие риски по сравнению с приведёнными.
+
+--- markdown cell ---
+## Limitations
+
+--- markdown cell ---
+Результаты анализа следует интерпретировать с учётом следующих ограничений данных и выбранной методологии.
+
+1. **Отсутствует временная структура данных.**
+   Датасет не содержит даты формирования выборки, выдачи кредита и последовательной истории платежей по месяцам. Поэтому невозможно оценить изменение качества портфеля во времени, выполнить vintage analysis, roll-rate / migration analysis и проверить устойчивость обнаруженных закономерностей на out-of-time выборке.
+
+2. **Отсутствуют данные для оценки экономического эффекта риска.**
+   В выборке нет размера кредита / экспозиции, EAD, LGD, процентной ставки, доходности клиента и величины фактических кредитных потерь. Поэтому результаты позволяют анализировать вероятность серьёзной просрочки и концентрацию bad events, но не позволяют оценивать ожидаемые денежные потери, прибыльность сегментов или экономически оптимальный credit cutoff.
+
+3. **Target отражает серьёзную просрочку, а не полноценное определение дефолта.**
+   Целевая переменная показывает наличие просрочки 90+ дней или более серьёзного нарушения платёжной дисциплины в следующие два года. Поэтому в рамках анализа `bad event` используется как показатель кредитного риска, но его не следует напрямую отождествлять с регуляторным или внутренним банковским определением default.
+
+4. **Часть значений имеет неизвестную бизнес-интерпретацию.**
+   Значения `96` и `98` в DPD-признаках синхронно встречаются сразу в нескольких полях и рассматриваются как специальные системные коды. Однако документация датасета не раскрывает их точного значения, поэтому любые более конкретные интерпретации этих наблюдений были бы предположительными.
+
+5. **Обнаруженные зависимости являются ассоциативными, а не причинными.**
+   Повышенный bad rate внутри определённого возрастного, доходного, долгового или иного сегмента не означает, что соответствующая характеристика является причиной будущей просрочки. Наблюдаемая связь может частично объясняться другими коррелирующими характеристиками заёмщиков.
+
+6. **Границы части аналитических сегментов выбраны с использованием наблюдаемого bad-rate profile.**
+   Для непрерывных признаков предварительные fine bins использовались для изучения формы зависимости с target, после чего соседние группы объединялись в более крупные и интерпретируемые сегменты. Поэтому различия между такими сегментами следует рассматривать как закономерности, обнаруженные в данной выборке, а не как независимо подтверждённые универсальные risk cutoffs.
+
+7. **Pairwise-анализ включает перебор большого количества сочетаний сегментов.**
+   При множественном поиске пересечений возрастает вероятность обнаружения комбинаций с высоким bad rate частично вследствие случайных особенностей выборки. Для снижения этого эффекта использовались ограничения на минимальный размер сегмента и долю bad events, однако наиболее перспективные комбинации желательно дополнительно проверять на независимой validation или out-of-time выборке.
+
+8. **Набор доступных признаков ограничен.**
+   Датасет содержит только небольшое количество агрегированных характеристик клиента и не включает детальную кредитную историю, типы кредитных продуктов, даты и суммы платежей, запросы в кредитное бюро, региональные и другие потенциально значимые факторы. Поэтому проведённый анализ не отражает всей структуры риска, которая была бы доступна в реальном банковском портфеле.
+
+Таким образом, полученные результаты следует рассматривать как **аналитическое исследование структуры кредитного риска внутри доступной выборки**. Они позволяют выявить risk gradients, концентрацию bad events и потенциально значимые сочетания характеристик, но не являются готовой кредитной политикой или доказательством устойчивости обнаруженных зависимостей на будущих портфелях.
+
+
+
+============================================================
 src\scripts\__init__.py
 ============================================================
 
 
 
 ============================================================
-src\scripts\prepare_dataset_after_data_quality_analysis.py
+src\scripts\make_raw_data_db.py
+============================================================
+
+import sqlite3
+import pandas as pd
+
+
+def make_raw_data_db() -> None:
+    dataset = pd.read_csv("data/raw/cs-training.csv")
+    dataset = dataset.drop(columns=["Unnamed: 0"])
+    
+    dataset = dataset.rename(columns={
+        "SeriousDlqin2yrs": "target",
+        "RevolvingUtilizationOfUnsecuredLines": "revolving_utilization",
+        "age": "age",
+        "NumberOfTime30-59DaysPastDueNotWorse": "num_30_59_days_late",
+        "DebtRatio": "debt_ratio",
+        "MonthlyIncome": "monthly_income",
+        "NumberOfOpenCreditLinesAndLoans": "num_open_credit_lines",
+        "NumberOfTimes90DaysLate": "num_90_days_late",
+        "NumberRealEstateLoansOrLines": "num_real_estate_loans",
+        "NumberOfTime60-89DaysPastDueNotWorse": "num_60_89_days_late",
+        "NumberOfDependents": "num_dependents"
+    })
+
+    dataset["borrower_id"] = list(range(dataset.shape[0]))
+
+    conn = sqlite3.connect("sql_analysis/raw_data.db")
+
+    dataset.to_sql(
+        "borrowers",
+        conn,
+        if_exists="replace",
+        index=False
+    )
+
+    conn.close()
+
+============================================================
+src\scripts\prepare_analytical_dataset.py
 ============================================================
 
 from pathlib import Path
@@ -1388,12 +4210,184 @@ from pathlib import Path
 from utils.data_quality_prepare import data_quality_prepare
 
 
-def prepare_dataset_after_data_quality_analysis() -> None:
+def prepare_analytical_dataset() -> None:
     data_path = Path("data/raw/cs-training.csv")
-    output_path = Path("data/prepare_after_data_quality_analysis/cs-training.csv")
+    output_path = Path("data/interim/borrowers.csv")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     data_quality_prepare(data_path=data_path, out_path=output_path)
+
+============================================================
+src\sql_analysis\01_portfolio_overview.sql
+============================================================
+
+--------------------------------------------------------------
+-- Вывод признаков и их типов данных
+--------------------------------------------------------------
+SELECT
+    name AS column_name,
+    type AS data_type
+FROM pragma_table_info('borrowers')
+ORDER BY cid
+--------------------------------------------------------------
+-- Размер датасета, количество bad evetns, bad rate
+--------------------------------------------------------------
+SELECT
+    COUNT(*) as num_borrowers,
+    SUM(target) as num_bad_borrowers,
+    AVG(target) as bad_rate
+FROM borrowers
+--------------------------------------------------------------
+-- Вывод количества пропусков по признакам
+--------------------------------------------------------------
+SELECT
+    COUNT(*) - COUNT(target) AS target_mis_count,
+    COUNT(*) - COUNT(revolving_utilization) AS rev_util_mis_count,
+    COUNT(*) - COUNT(age) AS age_mis_count,
+    COUNT(*) - COUNT(num_30_59_days_late) AS DPD_30_59_mis_count,
+    COUNT(*) - COUNT(debt_ratio) AS debt_ratio_mis_count,
+    COUNT(*) - COUNT(monthly_income) AS monthly_income_mis_count,
+    COUNT(*) - COUNT(num_open_credit_lines) AS num_op_cr_lines_mis_count,
+    COUNT(*) - COUNT(num_90_days_late) AS DPD_90_mis_count,
+    COUNT(*) - COUNT(num_real_estate_loans) AS num_rel_est_ls_mis_count,
+    COUNT(*) - COUNT(num_60_89_days_late) AS DPD_60_89_mis_count,
+    COUNT(*) - COUNT(num_dependents) AS num_dependents_mis_count,
+    COUNT(*) - COUNT(borrower_id) AS borrower_id_mis_count
+FROM borrowers
+--------------------------------------------------------------
+-- Наличие дубликатов (borrower_id добавлен уже мной) без target
+--------------------------------------------------------------
+WITH duplicates AS (
+SELECT COUNT (*) as duplicated
+FROM borrowers
+GROUP BY
+    revolving_utilization,
+    age,
+    num_30_59_days_late,
+    debt_ratio,
+    monthly_income,
+    num_open_credit_lines,
+    num_90_days_late,
+    num_real_estate_loans,
+    num_60_89_days_late,
+    num_dependents
+HAVING COUNT(*) > 1
+)
+SELECT SUM(duplicated - 1) as num_duplicate_rows
+FROM duplicates
+--------------------------------------------------------------
+-- Наличие дубликатов (borrower_id добавлен уже мной) с target
+--------------------------------------------------------------
+WITH duplicates AS (
+SELECT COUNT (*) as duplicated
+FROM borrowers
+GROUP BY
+    target,
+    revolving_utilization,
+    age,
+    num_30_59_days_late,
+    debt_ratio,
+    monthly_income,
+    num_open_credit_lines,
+    num_90_days_late,
+    num_real_estate_loans,
+    num_60_89_days_late,
+    num_dependents
+HAVING COUNT(*) > 1
+)
+SELECT SUM(duplicated - 1) as num_duplicate_rows
+FROM duplicates
+--------------------------------------------------------------
+-- Примерный вид датасета
+--------------------------------------------------------------
+SELECT *
+FROM borrowers
+LIMIT 5
+
+============================================================
+src\sql_analysis\temp.ipynb
+============================================================
+
+--- code cell ---
+import sqlite3
+import pandas as pd
+
+--- code cell ---
+conn = sqlite3.connect("raw_data.db")
+
+--- code cell ---
+query = """
+    SELECT
+        name AS column_name,
+        type AS data_type
+    FROM pragma_table_info('borrowers')
+    ORDER BY cid
+"""
+
+--- code cell ---
+query = """
+SELECT
+    COUNT(*) as num_borrowers,
+    SUM(target) as num_bad_borrowers,
+    AVG(target) as bad_rate
+FROM borrowers
+"""
+
+--- code cell ---
+query = """
+SELECT
+    COUNT(*) - COUNT(target) AS target_mis_count,
+    COUNT(*) - COUNT(revolving_utilization) AS rev_util_mis_count,
+    COUNT(*) - COUNT(age) AS age_mis_count,
+    COUNT(*) - COUNT(num_30_59_days_late) AS DPD_30_59_mis_count,
+    COUNT(*) - COUNT(debt_ratio) AS debt_ratio_mis_count,
+    COUNT(*) - COUNT(monthly_income) AS monthly_income_mis_count,
+    COUNT(*) - COUNT(num_open_credit_lines) AS num_op_cr_lines_mis_count,
+    COUNT(*) - COUNT(num_90_days_late) AS DPD_90_mis_count,
+    COUNT(*) - COUNT(num_real_estate_loans) AS num_rel_est_ls_mis_count,
+    COUNT(*) - COUNT(num_60_89_days_late) AS DPD_60_89_mis_count,
+    COUNT(*) - COUNT(num_dependents) AS num_dependents_mis_count,
+    COUNT(*) - COUNT(borrower_id) AS borrower_id_mis_count
+FROM borrowers
+"""
+
+--- code cell ---
+query = """
+WITH duplicates AS (
+SELECT COUNT (*) as duplicated
+FROM borrowers
+GROUP BY
+    target,
+    revolving_utilization,
+    age,
+    num_30_59_days_late,
+    debt_ratio,
+    monthly_income,
+    num_open_credit_lines,
+    num_90_days_late,
+    num_real_estate_loans,
+    num_60_89_days_late,
+    num_dependents
+HAVING COUNT(*) > 1
+)
+SELECT SUM(duplicated - 1) as num_duplicate_rows
+FROM duplicates
+"""
+
+--- code cell ---
+query = """
+SELECT *
+FROM borrowers
+LIMIT 5
+"""
+
+--- code cell ---
+pd.read_sql(query, conn)
+
+--- code cell ---
+conn.close()
+
+
 
 ============================================================
 src\utils\__init__.py
@@ -1427,17 +4421,18 @@ def data_quality_prepare(data_path: Path, out_path: Path) -> None:
         "NumberOfDependents": "num_dependents"
     })
 
-    data["age_error"] = (data["age"] < 0).astype(int)
+    data["age_error"] = (data["age"] < 18).astype(int)
 
-    data["days_late_system_code"] = data.apply(
-        lambda x: (
-            1 if (
-                x["num_30_59_days_late"] == 96 or x["num_30_59_days_late"] == 98 or
-                x["num_60_89_days_late"] == 96 or x["num_60_89_days_late"] == 98 or
-                x["num_90_days_late"] == 96 or x["num_90_days_late"] == 98
-            ) else 0
-        ),
-        axis=1
+    dpd_columns = [
+        "num_30_59_days_late",
+        "num_60_89_days_late",
+        "num_90_days_late"
+    ]
+    data["days_late_system_code"] = (
+        data[dpd_columns]
+        .isin([96, 98])
+        .any(axis=1)
+        .astype(int)
     )
 
     data["monthly_income_is_missing"] = (data["monthly_income"].isna()).astype(int)
