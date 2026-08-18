@@ -1,3 +1,6 @@
 .venv/
 __pycache__/
 repo_dump.txt
+borrowers.db
+temp.py
+temp.ipynb
