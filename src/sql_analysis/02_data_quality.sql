@@ -92,7 +92,7 @@ FROM borrowers;
 --02-5-- Наличие логически несовместимых значений признаков
 --------------------------------------------------------------
 SELECT
-    SUM(CASE WHEN revolving_utilization > 0 AND num_open_credit_lines = 0 THEN 1 ELSE 0 END) AS invalid_rev_ut_AND_num_op_cr_lines,
+    SUM(CASE WHEN revolving_utilization > 0 AND num_open_credit_lines = 0 THEN 1 ELSE 0 END) AS potentially_inconsistent_rev_util_credit_lines,
     SUM(CASE WHEN num_open_credit_lines < num_real_estate_loans THEN 1 ELSE 0 END) AS invalid_num_op_cr_lines_AND_num_r_es_loans
 FROM borrowers;
 --------------------------------------------------------------
@@ -106,6 +106,7 @@ SELECT SUM (
         WHEN num_60_89_days_late = 98 THEN 1
         WHEN num_90_days_late = 96 THEN 1
         WHEN num_90_days_late = 98 THEN 1
+        ELSE 0
     END
 ) AS rows_with_special_codes
 FROM borrowers;
@@ -118,11 +119,13 @@ SELECT
             WHEN num_30_59_days_late = 96 OR num_30_59_days_late = 98 THEN 1
             WHEN num_60_89_days_late = 96 OR num_60_89_days_late = 98 THEN 1
             WHEN num_90_days_late = 96 OR num_90_days_late = 98 THEN 1
+            ELSE 0
         END
     ) - SUM (
         CASE
             WHEN num_30_59_days_late = 96 AND num_60_89_days_late = 96 AND num_90_days_late = 96 THEN 1
             WHEN num_30_59_days_late = 98 AND num_60_89_days_late = 98 AND num_90_days_late = 98 THEN 1
+            ELSE 0
         END
     ) AS not_consistency_special_codes
 FROM borrowers;

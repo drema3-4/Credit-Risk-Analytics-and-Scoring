@@ -4222,23 +4222,30 @@ src\sql_analysis\01_portfolio_overview.sql
 ============================================================
 
 --------------------------------------------------------------
--- Вывод признаков и их типов данных
+--01-1-- Вывод признаков и их типов данных
 --------------------------------------------------------------
 SELECT
     name AS column_name,
     type AS data_type
 FROM pragma_table_info('borrowers')
-ORDER BY cid
+ORDER BY cid;
 --------------------------------------------------------------
--- Размер датасета, количество bad evetns, bad rate
+--01-2-- Пример данных
+--------------------------------------------------------------
+SELECT *
+FROM borrowers
+LIMIT 5;
+--------------------------------------------------------------
+--01-3-- Размер датасета, good borrowers, bad borrowers, bad rate
 --------------------------------------------------------------
 SELECT
-    COUNT(*) as num_borrowers,
-    SUM(target) as num_bad_borrowers,
+    COUNT(*) AS num_borrowers,
+    SUM(CASE WHEN target = 0 THEN 1 ELSE 0 END) AS good_borrowers,
+    SUM(target) AS bad_borrowers,
     AVG(target) as bad_rate
-FROM borrowers
+FROM borrowers;
 --------------------------------------------------------------
--- Вывод количества пропусков по признакам
+--01-4-- Вывод количества пропусков по признакам
 --------------------------------------------------------------
 SELECT
     COUNT(*) - COUNT(target) AS target_mis_count,
@@ -4253,12 +4260,22 @@ SELECT
     COUNT(*) - COUNT(num_60_89_days_late) AS DPD_60_89_mis_count,
     COUNT(*) - COUNT(num_dependents) AS num_dependents_mis_count,
     COUNT(*) - COUNT(borrower_id) AS borrower_id_mis_count
-FROM borrowers
+FROM borrowers;
+
+============================================================
+src\sql_analysis\02_data_quality.sql
+============================================================
+
 --------------------------------------------------------------
--- Наличие дубликатов (borrower_id добавлен уже мной) без target
+--------------------------------------------------------------
+-- Дубликаты
+--------------------------------------------------------------
+--------------------------------------------------------------
+--------------------------------------------------------------
+--02-1-- Duplicate profiles (без target)
 --------------------------------------------------------------
 WITH duplicates AS (
-SELECT COUNT (*) as duplicated
+SELECT COUNT(*) as cnt
 FROM borrowers
 GROUP BY
     revolving_utilization,
@@ -4273,13 +4290,13 @@ GROUP BY
     num_dependents
 HAVING COUNT(*) > 1
 )
-SELECT SUM(duplicated - 1) as num_duplicate_rows
-FROM duplicates
+SELECT SUM(cnt - 1) as num_duplicate_profile_rows
+FROM duplicates;
 --------------------------------------------------------------
--- Наличие дубликатов (borrower_id добавлен уже мной) с target
+--02-2-- Полные дубликаты, включая target
 --------------------------------------------------------------
 WITH duplicates AS (
-SELECT COUNT (*) as duplicated
+SELECT COUNT(*) as cnt
 FROM borrowers
 GROUP BY
     target,
@@ -4295,14 +4312,1665 @@ GROUP BY
     num_dependents
 HAVING COUNT(*) > 1
 )
-SELECT SUM(duplicated - 1) as num_duplicate_rows
-FROM duplicates
+SELECT SUM(cnt - 1) as num_duplicate_profile_rows
+FROM duplicates;
 --------------------------------------------------------------
--- Примерный вид датасета
+--02-3-- Дубликаты с разными target
 --------------------------------------------------------------
-SELECT *
+WITH duplicates AS (
+SELECT COUNT(DISTINCT target) > 1 as cnt
 FROM borrowers
-LIMIT 5
+GROUP BY
+    revolving_utilization,
+    age,
+    num_30_59_days_late,
+    debt_ratio,
+    monthly_income,
+    num_open_credit_lines,
+    num_90_days_late,
+    num_real_estate_loans,
+    num_60_89_days_late,
+    num_dependents
+HAVING COUNT(*) > 1
+)
+SELECT SUM(cnt) as num_duplicate_profile_rows
+FROM duplicates;
+--------------------------------------------------------------
+--------------------------------------------------------------
+-- Валидация значений признаков
+--------------------------------------------------------------
+--------------------------------------------------------------
+--------------------------------------------------------------
+--02-4-- Наличие у признаков ошибочных значений
+--------------------------------------------------------------
+SELECT
+    SUM(CASE WHEN target <> 0 AND target <> 1 THEN 1 ELSE 0 END) AS num_invalid_target,
+    SUM(CASE WHEN revolving_utilization < 0 THEN 1 ELSE 0 END) AS num_invalid_revolving_utilization,
+    SUM(CASE WHEN age < 18 THEN 1 ELSE 0 END) AS num_invalid_age,
+    SUM(CASE WHEN num_30_59_days_late < 0 THEN 1 ELSE 0 END) AS num_invalid_num_30_59_days_late,
+    SUM(CASE WHEN debt_ratio < 0 THEN 1 ELSE 0 END) AS num_invalid_debt_ratio,
+    SUM(CASE WHEN monthly_income < 0 THEN 1 ELSE 0 END) AS num_invalid_monthly_income,
+    SUM(CASE WHEN num_open_credit_lines < 0 THEN 1 ELSE 0 END) AS num_invalid_num_open_credit_lines,
+    SUM(CASE WHEN num_90_days_late < 0 THEN 1 ELSE 0 END) AS num_invalid_num_90_days_late,
+    SUM(CASE WHEN num_real_estate_loans < 0 THEN 1 ELSE 0 END) AS num_invalid_num_real_estate_loans,
+    SUM(CASE WHEN num_60_89_days_late < 0 THEN 1 ELSE 0 END) AS num_invalid_num_60_89_days_late,
+    SUM(CASE WHEN num_dependents < 0 THEN 1 ELSE 0 END) AS num_invalid_num_dependents
+FROM borrowers;
+--------------------------------------------------------------
+--02-5-- Наличие логически несовместимых значений признаков
+--------------------------------------------------------------
+SELECT
+    SUM(CASE WHEN revolving_utilization > 0 AND num_open_credit_lines = 0 THEN 1 ELSE 0 END) AS invalid_rev_ut_AND_num_op_cr_lines,
+    SUM(CASE WHEN num_open_credit_lines < num_real_estate_loans THEN 1 ELSE 0 END) AS invalid_num_op_cr_lines_AND_num_r_es_loans
+FROM borrowers;
+--------------------------------------------------------------
+--02-6-- Специальные коды 96/98
+--------------------------------------------------------------
+SELECT SUM (
+    CASE
+        WHEN num_30_59_days_late = 96 THEN 1
+        WHEN num_30_59_days_late = 98 THEN 1
+        WHEN num_60_89_days_late = 96 THEN 1
+        WHEN num_60_89_days_late = 98 THEN 1
+        WHEN num_90_days_late = 96 THEN 1
+        WHEN num_90_days_late = 98 THEN 1
+    END
+) AS rows_with_special_codes
+FROM borrowers;
+--------------------------------------------------------------
+--02-7-- Согласованность специальных кодов 96/98
+--------------------------------------------------------------
+SELECT
+    SUM (
+        CASE
+            WHEN num_30_59_days_late = 96 OR num_30_59_days_late = 98 THEN 1
+            WHEN num_60_89_days_late = 96 OR num_60_89_days_late = 98 THEN 1
+            WHEN num_90_days_late = 96 OR num_90_days_late = 98 THEN 1
+        END
+    ) - SUM (
+        CASE
+            WHEN num_30_59_days_late = 96 AND num_60_89_days_late = 96 AND num_90_days_late = 96 THEN 1
+            WHEN num_30_59_days_late = 98 AND num_60_89_days_late = 98 AND num_90_days_late = 98 THEN 1
+        END
+    ) AS not_consistency_special_codes
+FROM borrowers;
+
+============================================================
+src\sql_analysis\03_delinquency_analysis.sql
+============================================================
+
+--------------------------------------------------------------
+--03-1-- Сегменты клиентов по наличию просрочек
+--------------------------------------------------------------
+WITH dpd_segments AS (
+SELECT
+    CASE
+        WHEN num_30_59_days_late = 0 AND num_60_89_days_late = 0 AND num_90_days_late = 0 THEN 'No DPD'
+        WHEN num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) OR
+                num_60_89_days_late > 0 AND num_60_89_days_late NOT IN (96, 98) OR
+                num_90_days_late > 0 AND num_90_days_late NOT IN (96, 98)
+                THEN 'Previous DPD'
+        WHEN num_30_59_days_late IN (96, 98) AND
+                num_60_89_days_late IN (96, 98) AND
+                num_90_days_late IN (96, 98)
+                THEN 'Special Code'
+    END AS segment,
+    CASE
+        WHEN num_30_59_days_late = 0 AND num_60_89_days_late = 0 AND num_90_days_late = 0 THEN 1
+        WHEN num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) OR
+                num_60_89_days_late > 0 AND num_60_89_days_late NOT IN (96, 98) OR
+                num_90_days_late > 0 AND num_90_days_late NOT IN (96, 98)
+                THEN 2
+        WHEN num_30_59_days_late IN (96, 98) AND
+                num_60_89_days_late IN (96, 98) AND
+                num_90_days_late IN (96, 98)
+                THEN 3
+    END AS severity_order,
+    *
+FROM borrowers
+)
+SELECT
+    segment, 
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    SUM(target) AS bads,
+    AVG(target) AS bad_rate
+FROM dpd_segments
+GROUP BY segment
+ORDER BY severity_order;
+--------------------------------------------------------------
+--03-2-- Сегменты клиентов с разными просрочками
+--------------------------------------------------------------
+WITH dpd_segments AS (
+SELECT
+    CASE
+        WHEN num_30_59_days_late = 0 AND num_60_89_days_late = 0 AND num_90_days_late = 0 THEN 'No DPD'
+        WHEN num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) AND
+             num_60_89_days_late = 0 AND num_90_days_late = 0
+             THEN '30-59 DPD'
+        WHEN num_60_89_days_late > 0 AND num_60_89_days_late NOT IN (96, 98) AND
+             num_30_59_days_late = 0 AND num_90_days_late = 0
+             THEN '60-89 DPD'
+        WHEN num_90_days_late > 0 AND num_90_days_late NOT IN (96, 98) AND
+             num_30_59_days_late = 0 AND num_60_89_days_late = 0
+             THEN '90+ DPD'
+        WHEN num_30_59_days_late IN (96, 98) AND
+             num_60_89_days_late IN (96, 98) AND
+             num_90_days_late IN (96, 98)
+             THEN 'Special Code'
+        ELSE 'Several DPD'
+    END AS segment,
+    CASE
+        WHEN num_30_59_days_late = 0 AND num_60_89_days_late = 0 AND num_90_days_late = 0 THEN 1
+        WHEN num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) AND
+             num_60_89_days_late = 0 AND num_90_days_late = 0
+             THEN 2
+        WHEN num_60_89_days_late > 0 AND num_60_89_days_late NOT IN (96, 98) AND
+             num_30_59_days_late = 0 AND num_90_days_late = 0
+             THEN 3
+        WHEN num_90_days_late > 0 AND num_90_days_late NOT IN (96, 98) AND
+             num_30_59_days_late = 0 AND num_60_89_days_late = 0
+             THEN 4
+        WHEN num_30_59_days_late IN (96, 98) AND
+             num_60_89_days_late IN (96, 98) AND
+             num_90_days_late IN (96, 98)
+             THEN 6
+        ELSE 5
+    END AS severity_order,
+    *
+FROM borrowers
+)
+SELECT 
+    segment, 
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    SUM(target) AS bads,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM dpd_segments
+GROUP BY segment
+ORDER BY severity_order;
+--------------------------------------------------------------
+--03-3-- Сегменты клиентов с разными просрочками (модифицированный вариант)
+--------------------------------------------------------------
+WITH dpd_segments AS (
+SELECT
+    CASE
+        WHEN num_30_59_days_late = 0 AND num_60_89_days_late = 0 AND num_90_days_late = 0 THEN 'No DPD'
+        WHEN num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) AND
+             num_60_89_days_late = 0 AND num_90_days_late = 0
+             THEN '30-59 DPD'
+        WHEN num_60_89_days_late > 0 AND num_60_89_days_late NOT IN (96, 98) AND
+             num_30_59_days_late = 0 AND num_90_days_late = 0
+             THEN '60-89 DPD'
+        WHEN num_90_days_late > 0 AND num_90_days_late NOT IN (96, 98) AND
+             num_30_59_days_late = 0 AND num_60_89_days_late = 0
+             THEN '90+ DPD'
+        WHEN num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) AND
+             num_60_89_days_late > 0 AND num_60_89_days_late NOT IN (96, 98) AND
+             num_90_days_late = 0
+             THEN '30-59 + 60-89 DPD'
+        WHEN num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) AND
+             num_90_days_late > 0 AND num_90_days_late NOT IN (96, 98) AND
+             num_60_89_days_late = 0
+             THEN '30-59 + 90+ DPD'
+        WHEN num_60_89_days_late > 0 AND num_60_89_days_late NOT IN (96, 98) AND
+             num_90_days_late > 0 AND num_90_days_late NOT IN (96, 98) AND
+             num_30_59_days_late = 0
+             THEN '60-89 + 90+ DPD'
+        WHEN num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) AND
+             num_60_89_days_late > 0 AND num_60_89_days_late NOT IN (96, 98) AND
+             num_90_days_late > 0 AND num_90_days_late NOT IN (96, 98)
+             THEN 'ALL DPD'
+        WHEN num_30_59_days_late IN (96, 98) AND
+             num_60_89_days_late IN (96, 98) AND
+             num_90_days_late IN (96, 98)
+             THEN 'Special Code'
+        ELSE 'Several DPD'
+    END AS segment,
+    CASE
+        WHEN num_30_59_days_late = 0 AND num_60_89_days_late = 0 AND num_90_days_late = 0 THEN 1
+        WHEN num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) AND
+             num_60_89_days_late = 0 AND num_90_days_late = 0
+             THEN 2
+        WHEN num_60_89_days_late > 0 AND num_60_89_days_late NOT IN (96, 98) AND
+             num_30_59_days_late = 0 AND num_90_days_late = 0
+             THEN 3
+        WHEN num_90_days_late > 0 AND num_90_days_late NOT IN (96, 98) AND
+             num_30_59_days_late = 0 AND num_60_89_days_late = 0
+             THEN 4
+        WHEN num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) AND
+             num_60_89_days_late > 0 AND num_60_89_days_late NOT IN (96, 98) AND
+             num_90_days_late = 0
+             THEN 5
+        WHEN num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) AND
+             num_90_days_late > 0 AND num_90_days_late NOT IN (96, 98) AND
+             num_60_89_days_late = 0
+             THEN 6
+        WHEN num_60_89_days_late > 0 AND num_60_89_days_late NOT IN (96, 98) AND
+             num_90_days_late > 0 AND num_90_days_late NOT IN (96, 98) AND
+             num_30_59_days_late = 0
+             THEN 7
+        WHEN num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) AND
+             num_60_89_days_late > 0 AND num_60_89_days_late NOT IN (96, 98) AND
+             num_90_days_late > 0 AND num_90_days_late NOT IN (96, 98)
+             THEN 8
+        WHEN num_30_59_days_late IN (96, 98) AND
+             num_60_89_days_late IN (96, 98) AND
+             num_90_days_late IN (96, 98)
+             THEN 9
+    END AS severity_order,
+    *
+FROM borrowers
+)
+SELECT 
+    segment, 
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    SUM(target) AS bads,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share
+FROM dpd_segments
+GROUP BY segment
+ORDER BY severity_order;
+--------------------------------------------------------------
+--03-4-- Кумулятивный охват bad borrowers по сегментам просрочек
+--------------------------------------------------------------
+WITH dpd_segments AS (
+SELECT
+    CASE
+        WHEN num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) THEN '30-59 DPD'
+        WHEN num_60_89_days_late > 0 AND num_60_89_days_late NOT IN (96, 98) THEN '60-89 DPD'
+        WHEN num_90_days_late > 0 AND num_90_days_late NOT IN (96, 98) THEN '90+ DPD'
+        ELSE 'No DPD OR Special Codes'
+    END AS segment,
+    CASE
+        WHEN num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) THEN 1
+        WHEN num_60_89_days_late > 0 AND num_60_89_days_late NOT IN (96, 98) THEN 2
+        WHEN num_90_days_late > 0 AND num_90_days_late NOT IN (96, 98) THEN 3
+        ELSE 4
+    END AS severity_order,
+    target
+FROM borrowers
+)
+SELECT 
+    segment, 
+    SUM(COUNT(*)) OVER(ORDER BY severity_order ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_borrowers,
+    SUM(SUM(target)) OVER(ORDER BY severity_order ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_bads
+FROM dpd_segments
+GROUP BY segment;
+
+============================================================
+src\sql_analysis\04_risk_segments.sql
+============================================================
+
+--------------------------------------------------------------
+--04-1-- Revolving Utilization risk segments
+--------------------------------------------------------------
+WITH revolving_utilization_segments AS(
+SELECT
+    CASE
+        WHEN revolving_utilization >= 0.0 AND revolving_utilization <= 0.2 THEN '[0.0, 0.2]'
+        WHEN revolving_utilization > 0.2 AND revolving_utilization <= 0.4 THEN '(0.2, 0.4]'
+        WHEN revolving_utilization > 0.4 AND revolving_utilization <= 0.5 THEN '(0.4, 0.5]'
+        WHEN revolving_utilization > 0.5 AND revolving_utilization <= 0.7 THEN '(0.5, 0.7]'
+        WHEN revolving_utilization > 0.7 AND revolving_utilization <= 1.0 THEN '(0.7, 1.0]'
+        WHEN revolving_utilization > 1.0 AND revolving_utilization <= 2.0 THEN '(1.0, 2.0]'
+        WHEN revolving_utilization > 2.0 AND revolving_utilization <= 5.0 THEN '(2.0, 5.0]'
+        WHEN revolving_utilization > 5.0 THEN '(5.0, inf]'
+    END AS segment,
+    CASE
+        WHEN revolving_utilization >= 0.0 AND revolving_utilization <= 0.2 THEN 1
+        WHEN revolving_utilization > 0.2 AND revolving_utilization <= 0.4 THEN 2
+        WHEN revolving_utilization > 0.4 AND revolving_utilization <= 0.5 THEN 3
+        WHEN revolving_utilization > 0.5 AND revolving_utilization <= 0.7 THEN 4
+        WHEN revolving_utilization > 0.7 AND revolving_utilization <= 1.0 THEN 5
+        WHEN revolving_utilization > 1.0 AND revolving_utilization <= 2.0 THEN 6
+        WHEN revolving_utilization > 2.0 AND revolving_utilization <= 5.0 THEN 7
+        WHEN revolving_utilization > 5.0 THEN 8
+    END AS severity_order,
+    target
+FROM borrowers
+)
+SELECT
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM revolving_utilization_segments
+GROUP BY segment
+ORDER BY severity_order;
+--------------------------------------------------------------
+--04-2-- Age risk segments
+--------------------------------------------------------------
+WITH age_segments AS(
+SELECT
+    CASE
+        WHEN age >= 0.0 AND age <= 22.0 THEN '[0.0, 22.0]'
+        WHEN age > 22.0 AND age <= 30.0 THEN '(22.0, 30.0]'
+        WHEN age > 30.0 AND age <= 45.0 THEN '(30.0, 45.0]'
+        WHEN age > 45.0 AND age <= 55.0 THEN '(45.0, 55.0]'
+        WHEN age > 55.0 AND age <= 75.0 THEN '(55.0, 75.0]'
+        WHEN age > 75.0 THEN '(75.0, inf]'
+    END AS segment,
+    CASE
+        WHEN age >= 0.0 AND age <= 22.0 THEN 1
+        WHEN age > 22.0 AND age <= 30.0 THEN 2
+        WHEN age > 30.0 AND age <= 45.0 THEN 3
+        WHEN age > 45.0 AND age <= 55.0 THEN 4
+        WHEN age > 55.0 AND age <= 75.0 THEN 5
+        WHEN age > 75.0 THEN 6
+    END AS severity_order,
+    target
+FROM borrowers
+)
+SELECT
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM age_segments
+GROUP BY segment
+ORDER BY severity_order;
+--------------------------------------------------------------
+--04-3-- 30-59 DPD risk segments
+--------------------------------------------------------------
+WITH DPD_30_59_segments AS(
+SELECT
+    CASE
+        WHEN num_30_59_days_late = 0 THEN '0'
+        WHEN num_30_59_days_late >= 1 AND num_30_59_days_late <= 2 THEN '[1, 2]'
+        WHEN num_30_59_days_late > 2 AND num_30_59_days_late <= 13 THEN '(2, 13]'
+        WHEN num_30_59_days_late = 96 THEN '96'
+        WHEN num_30_59_days_late = 98 THEN '98'
+    END AS segment,
+    CASE
+        WHEN num_30_59_days_late = 0 THEN 1
+        WHEN num_30_59_days_late >= 1 AND num_30_59_days_late <= 2 THEN 2
+        WHEN num_30_59_days_late > 2 AND num_30_59_days_late <= 13 THEN 3
+        WHEN num_30_59_days_late = 96 THEN 4
+        WHEN num_30_59_days_late = 98 THEN 5
+    END AS severity_order,
+    target
+FROM borrowers
+)
+SELECT
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM DPD_30_59_segments
+GROUP BY segment
+ORDER BY severity_order;
+--------------------------------------------------------------
+--04-4-- Debt Ratio DPD risk segments
+--------------------------------------------------------------
+WITH debt_ratio_segments AS(
+SELECT
+    CASE
+        WHEN debt_ratio >= 0.0 AND debt_ratio <= 0.1 THEN '[0.0, 0.1]'
+        WHEN debt_ratio > 0.1 AND debt_ratio <= 0.7 THEN '(0.1, 0.7]'
+        WHEN debt_ratio > 0.7 AND debt_ratio <= 1.0 THEN '(0.7, 1.0]'
+        WHEN debt_ratio > 1.0 AND debt_ratio <= 4.0 THEN '(1.0, 4.0]'
+        WHEN debt_ratio > 4.0 THEN '(4.0, inf]'
+    END AS segment,
+    CASE
+        WHEN debt_ratio >= 0.0 AND debt_ratio <= 0.1 THEN 1
+        WHEN debt_ratio > 0.1 AND debt_ratio <= 0.7 THEN 2
+        WHEN debt_ratio > 0.7 AND debt_ratio <= 1.0 THEN 3
+        WHEN debt_ratio > 1.0 AND debt_ratio <= 4.0 THEN 4
+        WHEN debt_ratio > 4.0 THEN 5
+    END AS severity_order,
+    target
+FROM borrowers
+)
+SELECT
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM debt_ratio_segments
+GROUP BY segment
+ORDER BY severity_order;
+--------------------------------------------------------------
+--04-5-- Monthly Income DPD risk segments
+--------------------------------------------------------------
+WITH monthly_income_segments AS(
+SELECT
+    CASE
+        WHEN monthly_income >= 0.0 AND monthly_income <= 900.0 THEN '[0.0, 900.0]'
+        WHEN monthly_income > 900.0 AND monthly_income <= 3000.0 THEN '(900.0, 3000.0]'
+        WHEN monthly_income > 3000.0 AND monthly_income <= 4500.0 THEN '(3000.0, 4500.0]'
+        WHEN monthly_income > 4500.0 AND monthly_income <= 6500.0 THEN '(4500.0, 6500.0]'
+        WHEN monthly_income > 6500.0 AND monthly_income <= 13000.0 THEN '(6500.0, 13000.0]'
+        WHEN monthly_income > 13000.0 THEN '(13000.0, inf]'
+        WHEN monthly_income IS NULL THEN 'NULL'
+    END AS segment,
+    CASE
+        WHEN monthly_income >= 0.0 AND monthly_income <= 900.0 THEN 1
+        WHEN monthly_income > 900.0 AND monthly_income <= 3000.0 THEN 2
+        WHEN monthly_income > 3000.0 AND monthly_income <= 4500.0 THEN 3
+        WHEN monthly_income > 4500.0 AND monthly_income <= 6500.0 THEN 4
+        WHEN monthly_income > 6500.0 AND monthly_income <= 13000.0 THEN 5
+        WHEN monthly_income > 13000.0 THEN 6
+        WHEN monthly_income IS NULL THEN 7
+    END AS severity_order,
+    target
+FROM borrowers
+)
+SELECT
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM monthly_income_segments
+GROUP BY segment
+ORDER BY severity_order;
+--------------------------------------------------------------
+--04-6-- Num Open Credit Lines DPD risk segments
+--------------------------------------------------------------
+WITH num_open_credit_lines_segments AS(
+SELECT
+    CASE
+        WHEN num_open_credit_lines = 0 THEN '0'
+        WHEN num_open_credit_lines >= 1 AND num_open_credit_lines <= 2 THEN '[1, 2]'
+        WHEN num_open_credit_lines > 2 AND num_open_credit_lines <= 58 THEN '(2, 58]'
+    END AS segment,
+    CASE
+        WHEN num_open_credit_lines = 0 THEN 1
+        WHEN num_open_credit_lines >= 1 AND num_open_credit_lines <= 2 THEN 2
+        WHEN num_open_credit_lines > 2 AND num_open_credit_lines <= 58 THEN 3
+    END AS severity_order,
+    target
+FROM borrowers
+)
+SELECT
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM num_open_credit_lines_segments
+GROUP BY segment
+ORDER BY severity_order;
+--------------------------------------------------------------
+--04-7-- 90+ DPD risk segments
+--------------------------------------------------------------
+WITH DPD_90_segments AS(
+SELECT
+    CASE
+        WHEN num_90_days_late = 0 THEN '0'
+        WHEN num_90_days_late >= 1 AND num_90_days_late <= 2 THEN '[1, 2]'
+        WHEN num_90_days_late > 2 AND num_90_days_late <= 17 THEN '(2, 17]'
+        WHEN num_90_days_late = 96 THEN '96'
+        WHEN num_90_days_late = 98 THEN '98'
+    END AS segment,
+    CASE
+        WHEN num_90_days_late = 0 THEN 1
+        WHEN num_90_days_late >= 1 AND num_90_days_late <= 2 THEN 2
+        WHEN num_90_days_late > 2 AND num_90_days_late <= 17 THEN 3
+        WHEN num_90_days_late = 96 THEN 4
+        WHEN num_90_days_late = 98 THEN 5
+    END AS severity_order,
+    target
+FROM borrowers
+)
+SELECT
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM DPD_90_segments
+GROUP BY segment
+ORDER BY severity_order;
+--------------------------------------------------------------
+--04-8-- Num Real Estate Loans DPD risk segments
+--------------------------------------------------------------
+WITH num_real_estate_loans_segments AS(
+SELECT
+    CASE
+        WHEN num_real_estate_loans = 0 THEN '0'
+        WHEN num_real_estate_loans >= 1 AND num_real_estate_loans <= 3 THEN '[1, 3]'
+        WHEN num_real_estate_loans > 3 AND num_real_estate_loans <= 54 THEN '(3, 54]'
+    END AS segment,
+    CASE
+        WHEN num_real_estate_loans = 0 THEN 1
+        WHEN num_real_estate_loans >= 1 AND num_real_estate_loans <= 3 THEN 2
+        WHEN num_real_estate_loans > 3 AND num_real_estate_loans <= 54 THEN 3
+    END AS severity_order,
+    target
+FROM borrowers
+)
+SELECT
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM num_real_estate_loans_segments
+GROUP BY segment
+ORDER BY severity_order;
+--------------------------------------------------------------
+--04-9-- 60-89 DPD risk segments
+--------------------------------------------------------------
+WITH DPD_60_89_segments AS(
+SELECT
+    CASE
+        WHEN num_60_89_days_late = 0 THEN '0'
+        WHEN num_60_89_days_late >= 1 AND num_60_89_days_late <= 2 THEN '[1, 2]'
+        WHEN num_60_89_days_late > 2 AND num_60_89_days_late <= 11 THEN '(2, 11]'
+        WHEN num_60_89_days_late = 96 THEN '96'
+        WHEN num_60_89_days_late = 98 THEN '98'
+    END AS segment,
+    CASE
+        WHEN num_60_89_days_late = 0 THEN 1
+        WHEN num_60_89_days_late >= 1 AND num_60_89_days_late <= 2 THEN 2
+        WHEN num_60_89_days_late > 2 AND num_60_89_days_late <= 11 THEN 3
+        WHEN num_60_89_days_late = 96 THEN 4
+        WHEN num_60_89_days_late = 98 THEN 5
+    END AS severity_order,
+    target
+FROM borrowers
+)
+SELECT
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM DPD_60_89_segments
+GROUP BY segment
+ORDER BY severity_order;
+--------------------------------------------------------------
+--04-10-- Num Dependents DPD risk segments
+--------------------------------------------------------------
+WITH num_dependents_segments AS(
+SELECT
+    CASE
+        WHEN num_dependents = 0 THEN '0'
+        WHEN num_dependents >= 1 AND num_dependents <= 2 THEN '[1, 2]'
+        WHEN num_dependents > 2 AND num_dependents <= 20 THEN '(2, 20]'
+        WHEN num_dependents IS NULL THEN 'NULL'
+    END AS segment,
+    CASE
+        WHEN num_dependents = 0 THEN 1
+        WHEN num_dependents >= 1 AND num_dependents <= 2 THEN 2
+        WHEN num_dependents > 2 AND num_dependents <= 20 THEN 3
+        WHEN num_dependents IS NULL THEN 4
+    END AS severity_order,
+    target
+FROM borrowers
+)
+SELECT
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM num_dependents_segments
+GROUP BY segment
+ORDER BY severity_order;
+--------------------------------------------------------------
+--04-11-- Общая агрегационная таблица
+--------------------------------------------------------------
+WITH revolving_utilization_segments AS(
+SELECT
+    CASE
+        WHEN revolving_utilization >= 0.0 AND revolving_utilization <= 0.2 THEN '[0.0, 0.2]'
+        WHEN revolving_utilization > 0.2 AND revolving_utilization <= 0.4 THEN '(0.2, 0.4]'
+        WHEN revolving_utilization > 0.4 AND revolving_utilization <= 0.5 THEN '(0.4, 0.5]'
+        WHEN revolving_utilization > 0.5 AND revolving_utilization <= 0.7 THEN '(0.5, 0.7]'
+        WHEN revolving_utilization > 0.7 AND revolving_utilization <= 1.0 THEN '(0.7, 1.0]'
+        WHEN revolving_utilization > 1.0 AND revolving_utilization <= 2.0 THEN '(1.0, 2.0]'
+        WHEN revolving_utilization > 2.0 AND revolving_utilization <= 5.0 THEN '(2.0, 5.0]'
+        WHEN revolving_utilization > 5.0 THEN '(5.0, inf]'
+    END AS segment,
+    CASE
+        WHEN revolving_utilization >= 0.0 AND revolving_utilization <= 0.2 THEN 1
+        WHEN revolving_utilization > 0.2 AND revolving_utilization <= 0.4 THEN 2
+        WHEN revolving_utilization > 0.4 AND revolving_utilization <= 0.5 THEN 3
+        WHEN revolving_utilization > 0.5 AND revolving_utilization <= 0.7 THEN 4
+        WHEN revolving_utilization > 0.7 AND revolving_utilization <= 1.0 THEN 5
+        WHEN revolving_utilization > 1.0 AND revolving_utilization <= 2.0 THEN 6
+        WHEN revolving_utilization > 2.0 AND revolving_utilization <= 5.0 THEN 7
+        WHEN revolving_utilization > 5.0 THEN 8
+    END AS severity_order,
+    target
+FROM borrowers
+),
+age_segments AS(
+SELECT
+    CASE
+        WHEN age >= 0.0 AND age <= 22.0 THEN '[0.0, 22.0]'
+        WHEN age > 22.0 AND age <= 30.0 THEN '(22.0, 30.0]'
+        WHEN age > 30.0 AND age <= 45.0 THEN '(30.0, 45.0]'
+        WHEN age > 45.0 AND age <= 55.0 THEN '(45.0, 55.0]'
+        WHEN age > 55.0 AND age <= 75.0 THEN '(55.0, 75.0]'
+        WHEN age > 75.0 THEN '(75.0, inf]'
+    END AS segment,
+    CASE
+        WHEN age >= 0.0 AND age <= 22.0 THEN 1
+        WHEN age > 22.0 AND age <= 30.0 THEN 2
+        WHEN age > 30.0 AND age <= 45.0 THEN 3
+        WHEN age > 45.0 AND age <= 55.0 THEN 4
+        WHEN age > 55.0 AND age <= 75.0 THEN 5
+        WHEN age > 75.0 THEN 6
+    END AS severity_order,
+    target
+FROM borrowers
+),
+DPD_30_59_segments AS(
+SELECT
+    CASE
+        WHEN num_30_59_days_late = 0 THEN '0'
+        WHEN num_30_59_days_late >= 1 AND num_30_59_days_late <= 2 THEN '[1, 2]'
+        WHEN num_30_59_days_late > 2 AND num_30_59_days_late <= 13 THEN '(2, 13]'
+        WHEN num_30_59_days_late = 96 THEN '96'
+        WHEN num_30_59_days_late = 98 THEN '98'
+    END AS segment,
+    CASE
+        WHEN num_30_59_days_late = 0 THEN 1
+        WHEN num_30_59_days_late >= 1 AND num_30_59_days_late <= 2 THEN 2
+        WHEN num_30_59_days_late > 2 AND num_30_59_days_late <= 13 THEN 3
+        WHEN num_30_59_days_late = 96 THEN 4
+        WHEN num_30_59_days_late = 98 THEN 5
+    END AS severity_order,
+    target
+FROM borrowers
+),
+debt_ratio_segments AS(
+SELECT
+    CASE
+        WHEN debt_ratio >= 0.0 AND debt_ratio <= 0.1 THEN '[0.0, 0.1]'
+        WHEN debt_ratio > 0.1 AND debt_ratio <= 0.7 THEN '(0.1, 0.7]'
+        WHEN debt_ratio > 0.7 AND debt_ratio <= 1.0 THEN '(0.7, 1.0]'
+        WHEN debt_ratio > 1.0 AND debt_ratio <= 4.0 THEN '(1.0, 4.0]'
+        WHEN debt_ratio > 4.0 THEN '(4.0, inf]'
+    END AS segment,
+    CASE
+        WHEN debt_ratio >= 0.0 AND debt_ratio <= 0.1 THEN 1
+        WHEN debt_ratio > 0.1 AND debt_ratio <= 0.7 THEN 2
+        WHEN debt_ratio > 0.7 AND debt_ratio <= 1.0 THEN 3
+        WHEN debt_ratio > 1.0 AND debt_ratio <= 4.0 THEN 4
+        WHEN debt_ratio > 4.0 THEN 5
+    END AS severity_order,
+    target
+FROM borrowers
+),
+monthly_income_segments AS(
+SELECT
+    CASE
+        WHEN monthly_income >= 0.0 AND monthly_income <= 900.0 THEN '[0.0, 900.0]'
+        WHEN monthly_income > 900.0 AND monthly_income <= 3000.0 THEN '(900.0, 3000.0]'
+        WHEN monthly_income > 3000.0 AND monthly_income <= 4500.0 THEN '(3000.0, 4500.0]'
+        WHEN monthly_income > 4500.0 AND monthly_income <= 6500.0 THEN '(4500.0, 6500.0]'
+        WHEN monthly_income > 6500.0 AND monthly_income <= 13000.0 THEN '(6500.0, 13000.0]'
+        WHEN monthly_income > 13000.0 THEN '(13000.0, inf]'
+        WHEN monthly_income IS NULL THEN 'NULL'
+    END AS segment,
+    CASE
+        WHEN monthly_income >= 0.0 AND monthly_income <= 900.0 THEN 1
+        WHEN monthly_income > 900.0 AND monthly_income <= 3000.0 THEN 2
+        WHEN monthly_income > 3000.0 AND monthly_income <= 4500.0 THEN 3
+        WHEN monthly_income > 4500.0 AND monthly_income <= 6500.0 THEN 4
+        WHEN monthly_income > 6500.0 AND monthly_income <= 13000.0 THEN 5
+        WHEN monthly_income > 13000.0 THEN 6
+        WHEN monthly_income IS NULL THEN 7
+    END AS severity_order,
+    target
+FROM borrowers
+),
+num_open_credit_lines_segments AS(
+SELECT
+    CASE
+        WHEN num_open_credit_lines = 0 THEN '0'
+        WHEN num_open_credit_lines >= 1 AND num_open_credit_lines <= 2 THEN '[1, 2]'
+        WHEN num_open_credit_lines > 2 AND num_open_credit_lines <= 58 THEN '(2, 58]'
+    END AS segment,
+    CASE
+        WHEN num_open_credit_lines = 0 THEN 1
+        WHEN num_open_credit_lines >= 1 AND num_open_credit_lines <= 2 THEN 2
+        WHEN num_open_credit_lines > 2 AND num_open_credit_lines <= 58 THEN 3
+    END AS severity_order,
+    target
+FROM borrowers
+),
+DPD_90_segments AS(
+SELECT
+    CASE
+        WHEN num_90_days_late = 0 THEN '0'
+        WHEN num_90_days_late >= 1 AND num_90_days_late <= 2 THEN '[1, 2]'
+        WHEN num_90_days_late > 2 AND num_90_days_late <= 17 THEN '(2, 17]'
+        WHEN num_90_days_late = 96 THEN '96'
+        WHEN num_90_days_late = 98 THEN '98'
+    END AS segment,
+    CASE
+        WHEN num_90_days_late = 0 THEN 1
+        WHEN num_90_days_late >= 1 AND num_90_days_late <= 2 THEN 2
+        WHEN num_90_days_late > 2 AND num_90_days_late <= 17 THEN 3
+        WHEN num_90_days_late = 96 THEN 4
+        WHEN num_90_days_late = 98 THEN 5
+    END AS severity_order,
+    target
+FROM borrowers
+),
+num_real_estate_loans_segments AS(
+SELECT
+    CASE
+        WHEN num_real_estate_loans = 0 THEN '0'
+        WHEN num_real_estate_loans >= 1 AND num_real_estate_loans <= 3 THEN '[1, 3]'
+        WHEN num_real_estate_loans > 3 AND num_real_estate_loans <= 54 THEN '(3, 54]'
+    END AS segment,
+    CASE
+        WHEN num_real_estate_loans = 0 THEN 1
+        WHEN num_real_estate_loans >= 1 AND num_real_estate_loans <= 3 THEN 2
+        WHEN num_real_estate_loans > 3 AND num_real_estate_loans <= 54 THEN 3
+    END AS severity_order,
+    target
+FROM borrowers
+),
+DPD_60_89_segments AS(
+SELECT
+    CASE
+        WHEN num_60_89_days_late = 0 THEN '0'
+        WHEN num_60_89_days_late >= 1 AND num_60_89_days_late <= 2 THEN '[1, 2]'
+        WHEN num_60_89_days_late > 2 AND num_60_89_days_late <= 11 THEN '(2, 11]'
+        WHEN num_60_89_days_late = 96 THEN '96'
+        WHEN num_60_89_days_late = 98 THEN '98'
+    END AS segment,
+    CASE
+        WHEN num_60_89_days_late = 0 THEN 1
+        WHEN num_60_89_days_late >= 1 AND num_60_89_days_late <= 2 THEN 2
+        WHEN num_60_89_days_late > 2 AND num_60_89_days_late <= 11 THEN 3
+        WHEN num_60_89_days_late = 96 THEN 4
+        WHEN num_60_89_days_late = 98 THEN 5
+    END AS severity_order,
+    target
+FROM borrowers
+),
+num_dependents_segments AS(
+SELECT
+    CASE
+        WHEN num_dependents = 0 THEN '0'
+        WHEN num_dependents >= 1 AND num_dependents <= 2 THEN '[1, 2]'
+        WHEN num_dependents > 2 AND num_dependents <= 20 THEN '(2, 20]'
+        WHEN num_dependents IS NULL THEN 'NULL'
+    END AS segment,
+    CASE
+        WHEN num_dependents = 0 THEN 1
+        WHEN num_dependents >= 1 AND num_dependents <= 2 THEN 2
+        WHEN num_dependents > 2 AND num_dependents <= 20 THEN 3
+        WHEN num_dependents IS NULL THEN 4
+    END AS severity_order,
+    target
+FROM borrowers
+)
+SELECT feature, segment, borrowers, portfolio_share, bad_rate, lift
+FROM (
+SELECT
+    'revolving_utilization' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM revolving_utilization_segments
+GROUP BY segment
+UNION
+SELECT
+    'age' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM age_segments
+GROUP BY segment
+UNION
+SELECT
+    'DPD_30_59' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM DPD_30_59_segments
+GROUP BY segment
+UNION
+SELECT
+    'debt_ratio' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM debt_ratio_segments
+GROUP BY segment
+UNION
+SELECT
+    'monthly_income' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM monthly_income_segments
+GROUP BY segment
+UNION
+SELECT
+    'num_open_credit_lines' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM num_open_credit_lines_segments
+GROUP BY segment
+UNION
+SELECT
+    'DPD_90' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM DPD_90_segments
+GROUP BY segment
+UNION
+SELECT
+    'num_real_estate_loans' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM num_real_estate_loans_segments
+GROUP BY segment
+UNION
+SELECT
+    'DPD_60_89' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM DPD_60_89_segments
+GROUP BY segment
+UNION
+SELECT
+    'num_dependents' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM num_dependents_segments
+GROUP BY segment
+) AS t
+ORDER BY feature, severity_order;
+
+============================================================
+src\sql_analysis\05_risk_concentration.sql
+============================================================
+
+--------------------------------------------------------------
+--------------------------------------------------------------
+--------------------------------------------------------------
+--05-1-- Bad contribution по сегментам
+--------------------------------------------------------------
+--------------------------------------------------------------
+--------------------------------------------------------------
+WITH revolving_utilization_segments AS(
+SELECT
+    CASE
+        WHEN revolving_utilization >= 0.0 AND revolving_utilization <= 0.2 THEN '[0.0, 0.2]'
+        WHEN revolving_utilization > 0.2 AND revolving_utilization <= 0.4 THEN '(0.2, 0.4]'
+        WHEN revolving_utilization > 0.4 AND revolving_utilization <= 0.5 THEN '(0.4, 0.5]'
+        WHEN revolving_utilization > 0.5 AND revolving_utilization <= 0.7 THEN '(0.5, 0.7]'
+        WHEN revolving_utilization > 0.7 AND revolving_utilization <= 1.0 THEN '(0.7, 1.0]'
+        WHEN revolving_utilization > 1.0 AND revolving_utilization <= 2.0 THEN '(1.0, 2.0]'
+        WHEN revolving_utilization > 2.0 AND revolving_utilization <= 5.0 THEN '(2.0, 5.0]'
+        WHEN revolving_utilization > 5.0 THEN '(5.0, inf]'
+    END AS segment,
+    CASE
+        WHEN revolving_utilization >= 0.0 AND revolving_utilization <= 0.2 THEN 1
+        WHEN revolving_utilization > 0.2 AND revolving_utilization <= 0.4 THEN 2
+        WHEN revolving_utilization > 0.4 AND revolving_utilization <= 0.5 THEN 3
+        WHEN revolving_utilization > 0.5 AND revolving_utilization <= 0.7 THEN 4
+        WHEN revolving_utilization > 0.7 AND revolving_utilization <= 1.0 THEN 5
+        WHEN revolving_utilization > 1.0 AND revolving_utilization <= 2.0 THEN 6
+        WHEN revolving_utilization > 2.0 AND revolving_utilization <= 5.0 THEN 7
+        WHEN revolving_utilization > 5.0 THEN 8
+    END AS severity_order,
+    target
+FROM borrowers
+),
+age_segments AS(
+SELECT
+    CASE
+        WHEN age >= 0.0 AND age <= 22.0 THEN '[0.0, 22.0]'
+        WHEN age > 22.0 AND age <= 30.0 THEN '(22.0, 30.0]'
+        WHEN age > 30.0 AND age <= 45.0 THEN '(30.0, 45.0]'
+        WHEN age > 45.0 AND age <= 55.0 THEN '(45.0, 55.0]'
+        WHEN age > 55.0 AND age <= 75.0 THEN '(55.0, 75.0]'
+        WHEN age > 75.0 THEN '(75.0, inf]'
+    END AS segment,
+    CASE
+        WHEN age >= 0.0 AND age <= 22.0 THEN 1
+        WHEN age > 22.0 AND age <= 30.0 THEN 2
+        WHEN age > 30.0 AND age <= 45.0 THEN 3
+        WHEN age > 45.0 AND age <= 55.0 THEN 4
+        WHEN age > 55.0 AND age <= 75.0 THEN 5
+        WHEN age > 75.0 THEN 6
+    END AS severity_order,
+    target
+FROM borrowers
+),
+DPD_30_59_segments AS(
+SELECT
+    CASE
+        WHEN num_30_59_days_late = 0 THEN '0'
+        WHEN num_30_59_days_late >= 1 AND num_30_59_days_late <= 2 THEN '[1, 2]'
+        WHEN num_30_59_days_late > 2 AND num_30_59_days_late <= 13 THEN '(2, 13]'
+        WHEN num_30_59_days_late = 96 THEN '96'
+        WHEN num_30_59_days_late = 98 THEN '98'
+    END AS segment,
+    CASE
+        WHEN num_30_59_days_late = 0 THEN 1
+        WHEN num_30_59_days_late >= 1 AND num_30_59_days_late <= 2 THEN 2
+        WHEN num_30_59_days_late > 2 AND num_30_59_days_late <= 13 THEN 3
+        WHEN num_30_59_days_late = 96 THEN 4
+        WHEN num_30_59_days_late = 98 THEN 5
+    END AS severity_order,
+    target
+FROM borrowers
+),
+debt_ratio_segments AS(
+SELECT
+    CASE
+        WHEN debt_ratio >= 0.0 AND debt_ratio <= 0.1 THEN '[0.0, 0.1]'
+        WHEN debt_ratio > 0.1 AND debt_ratio <= 0.7 THEN '(0.1, 0.7]'
+        WHEN debt_ratio > 0.7 AND debt_ratio <= 1.0 THEN '(0.7, 1.0]'
+        WHEN debt_ratio > 1.0 AND debt_ratio <= 4.0 THEN '(1.0, 4.0]'
+        WHEN debt_ratio > 4.0 THEN '(4.0, inf]'
+    END AS segment,
+    CASE
+        WHEN debt_ratio >= 0.0 AND debt_ratio <= 0.1 THEN 1
+        WHEN debt_ratio > 0.1 AND debt_ratio <= 0.7 THEN 2
+        WHEN debt_ratio > 0.7 AND debt_ratio <= 1.0 THEN 3
+        WHEN debt_ratio > 1.0 AND debt_ratio <= 4.0 THEN 4
+        WHEN debt_ratio > 4.0 THEN 5
+    END AS severity_order,
+    target
+FROM borrowers
+),
+monthly_income_segments AS(
+SELECT
+    CASE
+        WHEN monthly_income >= 0.0 AND monthly_income <= 900.0 THEN '[0.0, 900.0]'
+        WHEN monthly_income > 900.0 AND monthly_income <= 3000.0 THEN '(900.0, 3000.0]'
+        WHEN monthly_income > 3000.0 AND monthly_income <= 4500.0 THEN '(3000.0, 4500.0]'
+        WHEN monthly_income > 4500.0 AND monthly_income <= 6500.0 THEN '(4500.0, 6500.0]'
+        WHEN monthly_income > 6500.0 AND monthly_income <= 13000.0 THEN '(6500.0, 13000.0]'
+        WHEN monthly_income > 13000.0 THEN '(13000.0, inf]'
+        WHEN monthly_income IS NULL THEN 'NULL'
+    END AS segment,
+    CASE
+        WHEN monthly_income >= 0.0 AND monthly_income <= 900.0 THEN 1
+        WHEN monthly_income > 900.0 AND monthly_income <= 3000.0 THEN 2
+        WHEN monthly_income > 3000.0 AND monthly_income <= 4500.0 THEN 3
+        WHEN monthly_income > 4500.0 AND monthly_income <= 6500.0 THEN 4
+        WHEN monthly_income > 6500.0 AND monthly_income <= 13000.0 THEN 5
+        WHEN monthly_income > 13000.0 THEN 6
+        WHEN monthly_income IS NULL THEN 7
+    END AS severity_order,
+    target
+FROM borrowers
+),
+num_open_credit_lines_segments AS(
+SELECT
+    CASE
+        WHEN num_open_credit_lines = 0 THEN '0'
+        WHEN num_open_credit_lines >= 1 AND num_open_credit_lines <= 2 THEN '[1, 2]'
+        WHEN num_open_credit_lines > 2 AND num_open_credit_lines <= 58 THEN '(2, 58]'
+    END AS segment,
+    CASE
+        WHEN num_open_credit_lines = 0 THEN 1
+        WHEN num_open_credit_lines >= 1 AND num_open_credit_lines <= 2 THEN 2
+        WHEN num_open_credit_lines > 2 AND num_open_credit_lines <= 58 THEN 3
+    END AS severity_order,
+    target
+FROM borrowers
+),
+DPD_90_segments AS(
+SELECT
+    CASE
+        WHEN num_90_days_late = 0 THEN '0'
+        WHEN num_90_days_late >= 1 AND num_90_days_late <= 2 THEN '[1, 2]'
+        WHEN num_90_days_late > 2 AND num_90_days_late <= 17 THEN '(2, 17]'
+        WHEN num_90_days_late = 96 THEN '96'
+        WHEN num_90_days_late = 98 THEN '98'
+    END AS segment,
+    CASE
+        WHEN num_90_days_late = 0 THEN 1
+        WHEN num_90_days_late >= 1 AND num_90_days_late <= 2 THEN 2
+        WHEN num_90_days_late > 2 AND num_90_days_late <= 17 THEN 3
+        WHEN num_90_days_late = 96 THEN 4
+        WHEN num_90_days_late = 98 THEN 5
+    END AS severity_order,
+    target
+FROM borrowers
+),
+num_real_estate_loans_segments AS(
+SELECT
+    CASE
+        WHEN num_real_estate_loans = 0 THEN '0'
+        WHEN num_real_estate_loans >= 1 AND num_real_estate_loans <= 3 THEN '[1, 3]'
+        WHEN num_real_estate_loans > 3 AND num_real_estate_loans <= 54 THEN '(3, 54]'
+    END AS segment,
+    CASE
+        WHEN num_real_estate_loans = 0 THEN 1
+        WHEN num_real_estate_loans >= 1 AND num_real_estate_loans <= 3 THEN 2
+        WHEN num_real_estate_loans > 3 AND num_real_estate_loans <= 54 THEN 3
+    END AS severity_order,
+    target
+FROM borrowers
+),
+DPD_60_89_segments AS(
+SELECT
+    CASE
+        WHEN num_60_89_days_late = 0 THEN '0'
+        WHEN num_60_89_days_late >= 1 AND num_60_89_days_late <= 2 THEN '[1, 2]'
+        WHEN num_60_89_days_late > 2 AND num_60_89_days_late <= 11 THEN '(2, 11]'
+        WHEN num_60_89_days_late = 96 THEN '96'
+        WHEN num_60_89_days_late = 98 THEN '98'
+    END AS segment,
+    CASE
+        WHEN num_60_89_days_late = 0 THEN 1
+        WHEN num_60_89_days_late >= 1 AND num_60_89_days_late <= 2 THEN 2
+        WHEN num_60_89_days_late > 2 AND num_60_89_days_late <= 11 THEN 3
+        WHEN num_60_89_days_late = 96 THEN 4
+        WHEN num_60_89_days_late = 98 THEN 5
+    END AS severity_order,
+    target
+FROM borrowers
+),
+num_dependents_segments AS(
+SELECT
+    CASE
+        WHEN num_dependents = 0 THEN '0'
+        WHEN num_dependents >= 1 AND num_dependents <= 2 THEN '[1, 2]'
+        WHEN num_dependents > 2 AND num_dependents <= 20 THEN '(2, 20]'
+        WHEN num_dependents IS NULL THEN 'NULL'
+    END AS segment,
+    CASE
+        WHEN num_dependents = 0 THEN 1
+        WHEN num_dependents >= 1 AND num_dependents <= 2 THEN 2
+        WHEN num_dependents > 2 AND num_dependents <= 20 THEN 3
+        WHEN num_dependents IS NULL THEN 4
+    END AS severity_order,
+    target
+FROM borrowers
+)
+SELECT feature, segment, borrowers, portfolio_share, bads, bad_share, bad_rate, lift
+FROM (
+SELECT
+    'revolving_utilization' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM revolving_utilization_segments
+GROUP BY segment
+UNION
+SELECT
+    'age' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM age_segments
+GROUP BY segment
+UNION
+SELECT
+    'DPD_30_59' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM DPD_30_59_segments
+GROUP BY segment
+UNION
+SELECT
+    'debt_ratio' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM debt_ratio_segments
+GROUP BY segment
+UNION
+SELECT
+    'monthly_income' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM monthly_income_segments
+GROUP BY segment
+UNION
+SELECT
+    'num_open_credit_lines' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM num_open_credit_lines_segments
+GROUP BY segment
+UNION
+SELECT
+    'DPD_90' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM DPD_90_segments
+GROUP BY segment
+UNION
+SELECT
+    'num_real_estate_loans' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM num_real_estate_loans_segments
+GROUP BY segment
+UNION
+SELECT
+    'DPD_60_89' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM DPD_60_89_segments
+GROUP BY segment
+UNION
+SELECT
+    'num_dependents' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM num_dependents_segments
+GROUP BY segment
+) AS t
+ORDER BY feature, severity_order;
+--------------------------------------------------------------
+--------------------------------------------------------------
+--------------------------------------------------------------
+-- Ранжирование по bad contribution и bad rate
+--------------------------------------------------------------
+--------------------------------------------------------------
+--------------------------------------------------------------
+--------------------------------------------------------------
+--05-2-- Revolving Utilization
+--------------------------------------------------------------
+WITH revolving_utilization_segments AS(
+SELECT
+    CASE
+        WHEN revolving_utilization >= 0.0 AND revolving_utilization <= 0.2 THEN '[0.0, 0.2]'
+        WHEN revolving_utilization > 0.2 AND revolving_utilization <= 0.4 THEN '(0.2, 0.4]'
+        WHEN revolving_utilization > 0.4 AND revolving_utilization <= 0.5 THEN '(0.4, 0.5]'
+        WHEN revolving_utilization > 0.5 AND revolving_utilization <= 0.7 THEN '(0.5, 0.7]'
+        WHEN revolving_utilization > 0.7 AND revolving_utilization <= 1.0 THEN '(0.7, 1.0]'
+        WHEN revolving_utilization > 1.0 AND revolving_utilization <= 2.0 THEN '(1.0, 2.0]'
+        WHEN revolving_utilization > 2.0 AND revolving_utilization <= 5.0 THEN '(2.0, 5.0]'
+        WHEN revolving_utilization > 5.0 THEN '(5.0, inf]'
+    END AS segment,
+    CASE
+        WHEN revolving_utilization >= 0.0 AND revolving_utilization <= 0.2 THEN 1
+        WHEN revolving_utilization > 0.2 AND revolving_utilization <= 0.4 THEN 2
+        WHEN revolving_utilization > 0.4 AND revolving_utilization <= 0.5 THEN 3
+        WHEN revolving_utilization > 0.5 AND revolving_utilization <= 0.7 THEN 4
+        WHEN revolving_utilization > 0.7 AND revolving_utilization <= 1.0 THEN 5
+        WHEN revolving_utilization > 1.0 AND revolving_utilization <= 2.0 THEN 6
+        WHEN revolving_utilization > 2.0 AND revolving_utilization <= 5.0 THEN 7
+        WHEN revolving_utilization > 5.0 THEN 8
+    END AS severity_order,
+    target
+FROM borrowers
+)
+SELECT
+    RANK() OVER(ORDER BY SUM(target) DESC) AS bad_rate_rank,
+    RANK() OVER(ORDER BY AVG(target) DESC) AS bad_contribution_rank,
+    segment,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bads_share
+FROM revolving_utilization_segments
+GROUP BY segment
+ORDER BY severity_order;
+--------------------------------------------------------------
+--05-3-- Age
+--------------------------------------------------------------
+WITH age_segments AS(
+SELECT
+    CASE
+        WHEN age >= 0.0 AND age <= 22.0 THEN '[0.0, 22.0]'
+        WHEN age > 22.0 AND age <= 30.0 THEN '(22.0, 30.0]'
+        WHEN age > 30.0 AND age <= 45.0 THEN '(30.0, 45.0]'
+        WHEN age > 45.0 AND age <= 55.0 THEN '(45.0, 55.0]'
+        WHEN age > 55.0 AND age <= 75.0 THEN '(55.0, 75.0]'
+        WHEN age > 75.0 THEN '(75.0, inf]'
+    END AS segment,
+    CASE
+        WHEN age >= 0.0 AND age <= 22.0 THEN 1
+        WHEN age > 22.0 AND age <= 30.0 THEN 2
+        WHEN age > 30.0 AND age <= 45.0 THEN 3
+        WHEN age > 45.0 AND age <= 55.0 THEN 4
+        WHEN age > 55.0 AND age <= 75.0 THEN 5
+        WHEN age > 75.0 THEN 6
+    END AS severity_order,
+    target
+FROM borrowers
+)
+SELECT
+    RANK() OVER(ORDER BY SUM(target) DESC) AS bad_rate_rank,
+    RANK() OVER(ORDER BY AVG(target) DESC) AS bad_contribution_rank,
+    segment,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bads_share
+FROM age_segments
+GROUP BY segment
+ORDER BY severity_order;
+--------------------------------------------------------------
+--05-4-- 30-59 DPD
+--------------------------------------------------------------
+WITH DPD_30_59_segments AS(
+SELECT
+    CASE
+        WHEN num_30_59_days_late = 0 THEN '0'
+        WHEN num_30_59_days_late >= 1 AND num_30_59_days_late <= 2 THEN '[1, 2]'
+        WHEN num_30_59_days_late > 2 AND num_30_59_days_late <= 13 THEN '(2, 13]'
+        WHEN num_30_59_days_late = 96 THEN '96'
+        WHEN num_30_59_days_late = 98 THEN '98'
+    END AS segment,
+    CASE
+        WHEN num_30_59_days_late = 0 THEN 1
+        WHEN num_30_59_days_late >= 1 AND num_30_59_days_late <= 2 THEN 2
+        WHEN num_30_59_days_late > 2 AND num_30_59_days_late <= 13 THEN 3
+        WHEN num_30_59_days_late = 96 THEN 4
+        WHEN num_30_59_days_late = 98 THEN 5
+    END AS severity_order,
+    target
+FROM borrowers
+)
+SELECT
+    RANK() OVER(ORDER BY SUM(target) DESC) AS bad_rate_rank,
+    RANK() OVER(ORDER BY AVG(target) DESC) AS bad_contribution_rank,
+    segment,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bads_share
+FROM DPD_30_59_segments
+GROUP BY segment
+ORDER BY severity_order;
+--------------------------------------------------------------
+--05-5-- Debt Ratio DPD
+--------------------------------------------------------------
+WITH debt_ratio_segments AS(
+SELECT
+    CASE
+        WHEN debt_ratio >= 0.0 AND debt_ratio <= 0.1 THEN '[0.0, 0.1]'
+        WHEN debt_ratio > 0.1 AND debt_ratio <= 0.7 THEN '(0.1, 0.7]'
+        WHEN debt_ratio > 0.7 AND debt_ratio <= 1.0 THEN '(0.7, 1.0]'
+        WHEN debt_ratio > 1.0 AND debt_ratio <= 4.0 THEN '(1.0, 4.0]'
+        WHEN debt_ratio > 4.0 THEN '(4.0, inf]'
+    END AS segment,
+    CASE
+        WHEN debt_ratio >= 0.0 AND debt_ratio <= 0.1 THEN 1
+        WHEN debt_ratio > 0.1 AND debt_ratio <= 0.7 THEN 2
+        WHEN debt_ratio > 0.7 AND debt_ratio <= 1.0 THEN 3
+        WHEN debt_ratio > 1.0 AND debt_ratio <= 4.0 THEN 4
+        WHEN debt_ratio > 4.0 THEN 5
+    END AS severity_order,
+    target
+FROM borrowers
+)
+SELECT
+    RANK() OVER(ORDER BY SUM(target) DESC) AS bad_rate_rank,
+    RANK() OVER(ORDER BY AVG(target) DESC) AS bad_contribution_rank,
+    segment,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bads_share
+FROM debt_ratio_segments
+GROUP BY segment
+ORDER BY severity_order;
+--------------------------------------------------------------
+--05-6-- Monthly Income DPD
+--------------------------------------------------------------
+WITH monthly_income_segments AS(
+SELECT
+    CASE
+        WHEN monthly_income >= 0.0 AND monthly_income <= 900.0 THEN '[0.0, 900.0]'
+        WHEN monthly_income > 900.0 AND monthly_income <= 3000.0 THEN '(900.0, 3000.0]'
+        WHEN monthly_income > 3000.0 AND monthly_income <= 4500.0 THEN '(3000.0, 4500.0]'
+        WHEN monthly_income > 4500.0 AND monthly_income <= 6500.0 THEN '(4500.0, 6500.0]'
+        WHEN monthly_income > 6500.0 AND monthly_income <= 13000.0 THEN '(6500.0, 13000.0]'
+        WHEN monthly_income > 13000.0 THEN '(13000.0, inf]'
+        WHEN monthly_income IS NULL THEN 'NULL'
+    END AS segment,
+    CASE
+        WHEN monthly_income >= 0.0 AND monthly_income <= 900.0 THEN 1
+        WHEN monthly_income > 900.0 AND monthly_income <= 3000.0 THEN 2
+        WHEN monthly_income > 3000.0 AND monthly_income <= 4500.0 THEN 3
+        WHEN monthly_income > 4500.0 AND monthly_income <= 6500.0 THEN 4
+        WHEN monthly_income > 6500.0 AND monthly_income <= 13000.0 THEN 5
+        WHEN monthly_income > 13000.0 THEN 6
+        WHEN monthly_income IS NULL THEN 7
+    END AS severity_order,
+    target
+FROM borrowers
+)
+SELECT
+    RANK() OVER(ORDER BY SUM(target) DESC) AS bad_rate_rank,
+    RANK() OVER(ORDER BY AVG(target) DESC) AS bad_contribution_rank,
+    segment,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bads_share
+FROM monthly_income_segments
+GROUP BY segment
+ORDER BY severity_order;
+--------------------------------------------------------------
+--05-7-- Num Open Credit Lines DPD
+--------------------------------------------------------------
+WITH num_open_credit_lines_segments AS(
+SELECT
+    CASE
+        WHEN num_open_credit_lines = 0 THEN '0'
+        WHEN num_open_credit_lines >= 1 AND num_open_credit_lines <= 2 THEN '[1, 2]'
+        WHEN num_open_credit_lines > 2 AND num_open_credit_lines <= 58 THEN '(2, 58]'
+    END AS segment,
+    CASE
+        WHEN num_open_credit_lines = 0 THEN 1
+        WHEN num_open_credit_lines >= 1 AND num_open_credit_lines <= 2 THEN 2
+        WHEN num_open_credit_lines > 2 AND num_open_credit_lines <= 58 THEN 3
+    END AS severity_order,
+    target
+FROM borrowers
+)
+SELECT
+    RANK() OVER(ORDER BY SUM(target) DESC) AS bad_rate_rank,
+    RANK() OVER(ORDER BY AVG(target) DESC) AS bad_contribution_rank,
+    segment,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bads_share
+FROM num_open_credit_lines_segments
+GROUP BY segment
+ORDER BY severity_order;
+--------------------------------------------------------------
+--05-8-- 90+ DPD
+--------------------------------------------------------------
+WITH DPD_90_segments AS(
+SELECT
+    CASE
+        WHEN num_90_days_late = 0 THEN '0'
+        WHEN num_90_days_late >= 1 AND num_90_days_late <= 2 THEN '[1, 2]'
+        WHEN num_90_days_late > 2 AND num_90_days_late <= 17 THEN '(2, 17]'
+        WHEN num_90_days_late = 96 THEN '96'
+        WHEN num_90_days_late = 98 THEN '98'
+    END AS segment,
+    CASE
+        WHEN num_90_days_late = 0 THEN 1
+        WHEN num_90_days_late >= 1 AND num_90_days_late <= 2 THEN 2
+        WHEN num_90_days_late > 2 AND num_90_days_late <= 17 THEN 3
+        WHEN num_90_days_late = 96 THEN 4
+        WHEN num_90_days_late = 98 THEN 5
+    END AS severity_order,
+    target
+FROM borrowers
+)
+SELECT
+    RANK() OVER(ORDER BY SUM(target) DESC) AS bad_rate_rank,
+    RANK() OVER(ORDER BY AVG(target) DESC) AS bad_contribution_rank,
+    segment,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bads_share
+FROM DPD_90_segments
+GROUP BY segment
+ORDER BY severity_order;
+--------------------------------------------------------------
+--05-9-- Num Real Estate Loans
+--------------------------------------------------------------
+WITH num_real_estate_loans_segments AS(
+SELECT
+    CASE
+        WHEN num_real_estate_loans = 0 THEN '0'
+        WHEN num_real_estate_loans >= 1 AND num_real_estate_loans <= 3 THEN '[1, 3]'
+        WHEN num_real_estate_loans > 3 AND num_real_estate_loans <= 54 THEN '(3, 54]'
+    END AS segment,
+    CASE
+        WHEN num_real_estate_loans = 0 THEN 1
+        WHEN num_real_estate_loans >= 1 AND num_real_estate_loans <= 3 THEN 2
+        WHEN num_real_estate_loans > 3 AND num_real_estate_loans <= 54 THEN 3
+    END AS severity_order,
+    target
+FROM borrowers
+)
+SELECT
+    RANK() OVER(ORDER BY SUM(target) DESC) AS bad_rate_rank,
+    RANK() OVER(ORDER BY AVG(target) DESC) AS bad_contribution_rank,
+    segment,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bads_share
+FROM num_real_estate_loans_segments
+GROUP BY segment
+ORDER BY severity_order;
+--------------------------------------------------------------
+--05-10-- 60-89 DPD
+--------------------------------------------------------------
+WITH DPD_60_89_segments AS(
+SELECT
+    CASE
+        WHEN num_60_89_days_late = 0 THEN '0'
+        WHEN num_60_89_days_late >= 1 AND num_60_89_days_late <= 2 THEN '[1, 2]'
+        WHEN num_60_89_days_late > 2 AND num_60_89_days_late <= 11 THEN '(2, 11]'
+        WHEN num_60_89_days_late = 96 THEN '96'
+        WHEN num_60_89_days_late = 98 THEN '98'
+    END AS segment,
+    CASE
+        WHEN num_60_89_days_late = 0 THEN 1
+        WHEN num_60_89_days_late >= 1 AND num_60_89_days_late <= 2 THEN 2
+        WHEN num_60_89_days_late > 2 AND num_60_89_days_late <= 11 THEN 3
+        WHEN num_60_89_days_late = 96 THEN 4
+        WHEN num_60_89_days_late = 98 THEN 5
+    END AS severity_order,
+    target
+FROM borrowers
+)
+SELECT
+    RANK() OVER(ORDER BY SUM(target) DESC) AS bad_rate_rank,
+    RANK() OVER(ORDER BY AVG(target) DESC) AS bad_contribution_rank,
+    segment,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bads_share
+FROM DPD_60_89_segments
+GROUP BY segment
+ORDER BY severity_order;
+--------------------------------------------------------------
+--05-11-- Num Dependents
+--------------------------------------------------------------
+WITH num_dependents_segments AS(
+SELECT
+    CASE
+        WHEN num_dependents = 0 THEN '0'
+        WHEN num_dependents >= 1 AND num_dependents <= 2 THEN '[1, 2]'
+        WHEN num_dependents > 2 AND num_dependents <= 20 THEN '(2, 20]'
+        WHEN num_dependents IS NULL THEN 'NULL'
+    END AS segment,
+    CASE
+        WHEN num_dependents = 0 THEN 1
+        WHEN num_dependents >= 1 AND num_dependents <= 2 THEN 2
+        WHEN num_dependents > 2 AND num_dependents <= 20 THEN 3
+        WHEN num_dependents IS NULL THEN 4
+    END AS severity_order,
+    target
+FROM borrowers
+)
+SELECT
+    RANK() OVER(ORDER BY SUM(target) DESC) AS bad_rate_rank,
+    RANK() OVER(ORDER BY AVG(target) DESC) AS bad_contribution_rank,
+    segment,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bads_share
+FROM num_dependents_segments
+GROUP BY segment
+ORDER BY severity_order;
+--------------------------------------------------------------
+--------------------------------------------------------------
+--------------------------------------------------------------
+--5-12 Risk markers
+--------------------------------------------------------------
+--------------------------------------------------------------
+--------------------------------------------------------------
+WITH risk_markers AS(
+SELECT
+    borrower_id,
+    CASE
+        WHEN revolving_utilization > 0.7 AND revolving_utilization <= 2.0 THEN 1 ELSE 0
+    END AS high_utilization,
+    CASE
+        WHEN num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) OR
+             num_60_89_days_late > 0 AND num_60_89_days_late NOT IN (96, 98) OR
+             num_90_days_late > 0 AND num_90_days_late NOT IN (96, 98)
+             THEN 1 ELSE 0
+    END AS has_previous_dpd,
+    CASE
+        WHEN debt_ratio > 0.7 AND debt_ratio < 4.0 THEN 1 ELSE 0
+    END AS high_debt_ratio,
+    CASE
+        WHEN num_open_credit_lines = 0 THEN 1 ELSE 0
+    END AS hasnt_credit_lines
+FROM borrowers
+)
+SELECT *
+FROM risk_markers;
+--------------------------------------------------------------
+--------------------------------------------------------------
+--------------------------------------------------------------
+--5-13 Risk markers count
+--------------------------------------------------------------
+--------------------------------------------------------------
+--------------------------------------------------------------
+WITH base_metrics AS (
+SELECT
+    COUNT(*) AS size,
+    SUM(target) AS bads,
+    AVG(target) AS bad_rate
+FROM borrowers
+)
+SELECT
+    'high_utilization' as marker,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / (SELECT size FROM base_metrics) AS portfolio_share,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / (SELECT bads FROM base_metrics) AS bads_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SELECT bad_rate FROM base_metrics) AS lift
+FROM borrowers
+WHERE revolving_utilization > 0.7 AND revolving_utilization <= 2.0
+UNION
+SELECT
+    'has_previous_dpd' as marker,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / (SELECT size FROM base_metrics) AS portfolio_share,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / (SELECT bads FROM base_metrics) AS bads_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SELECT bad_rate FROM base_metrics) AS lift
+FROM borrowers
+WHERE (
+    num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) OR
+    num_60_89_days_late > 0 AND num_60_89_days_late NOT IN (96, 98) OR
+    num_90_days_late > 0 AND num_90_days_late NOT IN (96, 98)
+)
+UNION
+SELECT
+    'high_debt_ratio' as marker,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / (SELECT size FROM base_metrics) AS portfolio_share,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / (SELECT bads FROM base_metrics) AS bads_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SELECT bad_rate FROM base_metrics) AS lift
+FROM borrowers
+WHERE debt_ratio > 0.7 AND debt_ratio < 4.0
+UNION
+SELECT
+    'hasnt_credit_lines' as marker,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / (SELECT size FROM base_metrics) AS portfolio_share,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / (SELECT bads FROM base_metrics) AS bads_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SELECT bad_rate FROM base_metrics) AS lift
+FROM borrowers
+WHERE num_open_credit_lines = 0;
 
 ============================================================
 src\sql_analysis\temp.ipynb
@@ -4317,68 +5985,11 @@ conn = sqlite3.connect("raw_data.db")
 
 --- code cell ---
 query = """
-    SELECT
-        name AS column_name,
-        type AS data_type
-    FROM pragma_table_info('borrowers')
-    ORDER BY cid
-"""
-
---- code cell ---
-query = """
 SELECT
-    COUNT(*) as num_borrowers,
-    SUM(target) as num_bad_borrowers,
-    AVG(target) as bad_rate
-FROM borrowers
-"""
-
---- code cell ---
-query = """
-SELECT
-    COUNT(*) - COUNT(target) AS target_mis_count,
-    COUNT(*) - COUNT(revolving_utilization) AS rev_util_mis_count,
-    COUNT(*) - COUNT(age) AS age_mis_count,
-    COUNT(*) - COUNT(num_30_59_days_late) AS DPD_30_59_mis_count,
-    COUNT(*) - COUNT(debt_ratio) AS debt_ratio_mis_count,
-    COUNT(*) - COUNT(monthly_income) AS monthly_income_mis_count,
-    COUNT(*) - COUNT(num_open_credit_lines) AS num_op_cr_lines_mis_count,
-    COUNT(*) - COUNT(num_90_days_late) AS DPD_90_mis_count,
-    COUNT(*) - COUNT(num_real_estate_loans) AS num_rel_est_ls_mis_count,
-    COUNT(*) - COUNT(num_60_89_days_late) AS DPD_60_89_mis_count,
-    COUNT(*) - COUNT(num_dependents) AS num_dependents_mis_count,
-    COUNT(*) - COUNT(borrower_id) AS borrower_id_mis_count
-FROM borrowers
-"""
-
---- code cell ---
-query = """
-WITH duplicates AS (
-SELECT COUNT (*) as duplicated
-FROM borrowers
-GROUP BY
-    target,
-    revolving_utilization,
-    age,
-    num_30_59_days_late,
-    debt_ratio,
-    monthly_income,
-    num_open_credit_lines,
-    num_90_days_late,
-    num_real_estate_loans,
-    num_60_89_days_late,
-    num_dependents
-HAVING COUNT(*) > 1
-)
-SELECT SUM(duplicated - 1) as num_duplicate_rows
-FROM duplicates
-"""
-
---- code cell ---
-query = """
-SELECT *
-FROM borrowers
-LIMIT 5
+    name AS column_name,
+    type AS data_type
+FROM pragma_table_info('borrowers')
+ORDER BY cid;
 """
 
 --- code cell ---

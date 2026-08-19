@@ -31,11 +31,11 @@ FROM borrowers
 SELECT
     segment, 
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     SUM(target) AS bads,
     AVG(target) AS bad_rate
 FROM dpd_segments
-GROUP BY segment
+GROUP BY segment, severity_order
 ORDER BY severity_order;
 --------------------------------------------------------------
 --03-2-- Сегменты клиентов с разными просрочками
@@ -82,12 +82,12 @@ FROM borrowers
 SELECT 
     segment, 
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     SUM(target) AS bads,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM dpd_segments
-GROUP BY segment
+GROUP BY segment, severity_order
 ORDER BY severity_order;
 --------------------------------------------------------------
 --03-3-- Сегменты клиентов с разными просрочками (модифицированный вариант)
@@ -165,13 +165,13 @@ FROM borrowers
 SELECT 
     segment, 
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     SUM(target) AS bads,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift,
     SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share
 FROM dpd_segments
-GROUP BY segment
+GROUP BY segment, severity_order
 ORDER BY severity_order;
 --------------------------------------------------------------
 --03-4-- Кумулятивный охват bad borrowers по сегментам просрочек
@@ -179,15 +179,15 @@ ORDER BY severity_order;
 WITH dpd_segments AS (
 SELECT
     CASE
-        WHEN num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) THEN '30-59 DPD'
-        WHEN num_60_89_days_late > 0 AND num_60_89_days_late NOT IN (96, 98) THEN '60-89 DPD'
         WHEN num_90_days_late > 0 AND num_90_days_late NOT IN (96, 98) THEN '90+ DPD'
+        WHEN num_60_89_days_late > 0 AND num_60_89_days_late NOT IN (96, 98) THEN '60-89 DPD'
+        WHEN num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) THEN '30-59 DPD'
         ELSE 'No DPD OR Special Codes'
     END AS segment,
     CASE
-        WHEN num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) THEN 1
+        WHEN num_90_days_late > 0 AND num_90_days_late NOT IN (96, 98) THEN 1
         WHEN num_60_89_days_late > 0 AND num_60_89_days_late NOT IN (96, 98) THEN 2
-        WHEN num_90_days_late > 0 AND num_90_days_late NOT IN (96, 98) THEN 3
+        WHEN num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) THEN 3
         ELSE 4
     END AS severity_order,
     target
@@ -196,6 +196,9 @@ FROM borrowers
 SELECT 
     segment, 
     SUM(COUNT(*)) OVER(ORDER BY severity_order ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_borrowers,
-    SUM(SUM(target)) OVER(ORDER BY severity_order ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_bads
+    SUM(SUM(target)) OVER(ORDER BY severity_order ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) cumulative_bads,
+    SUM(SUM(target)) OVER(ORDER BY severity_order ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) * 1.0 /
+    SUM(SUM(target)) OVER()AS cumulative_bads_share
 FROM dpd_segments
-GROUP BY segment;
+GROUP BY segment, severity_order
+ORDER BY severity_order;
