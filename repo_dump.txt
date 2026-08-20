@@ -18,7 +18,10 @@ dependencies = [
     "jupyter (>=1.1.1,<2.0.0)",
     "statsmodels (>=0.14.6,<0.15.0)",
     "scipy (>=1.18.0,<2.0.0)",
-    "dataframe-image (>=0.2.7,<0.3.0)"
+    "dataframe-image (>=0.2.7,<0.3.0)",
+    "scikit-learn (>=1.9.0,<2.0.0)",
+    "optuna (>=4.9.0,<5.0.0)",
+    "catboost (>=1.2.10,<2.0.0)"
 ]
 
 
@@ -4157,6 +4160,523 @@ navigation["cross segment risk analysis summary"] = '(cross_segment_risk_analysi
 
 
 ============================================================
+src\notebooks\03_scoring.ipynb
+============================================================
+
+--- markdown cell ---
+# Импорт библиотек и настройка среды
+
+--- code cell ---
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+from sklearn.linear_model import LogisticRegression
+import optuna
+from catboost import CatBoostClassifier
+from sklearn.metrics import precision_score, recall_score, roc_auc_score, average_precision_score
+
+--- code cell ---
+pd.set_option("display.max_columns", 100)
+pd.set_option('display.max_colwidth', None)
+pd.set_option("display.max_rows", 200)
+pd.set_option("display.float_format", lambda x: f"{x:,.4f}")
+
+--- markdown cell ---
+# Вспомогательные функции
+
+--- markdown cell ---
+## Функция создания labels для cut разделения
+
+--- code cell ---
+def make_labels(
+    segments: list[float]
+) -> list[str]:
+    labels = []
+    
+    for i in range(len(segments) - 1):
+        left = segments[i]
+        right = segments[i + 1]
+
+        if i == 0:
+            labels.append(f"[{left}, {right}]")
+        else:
+            labels.append(f"({left}, {right}]")
+
+    return labels
+
+--- markdown cell ---
+## Функция создания новых столбцов признака
+
+--- code cell ---
+def make_segments_cols(
+    data: pd.DataFrame,
+    feature: str,
+    segments: list[float],
+    special_values: list[int] = []
+) -> pd.DataFrame:
+    df = data.copy(deep=True)
+
+    labels = make_labels(segments)
+
+    segment_col_name = f"{feature}_segments"
+
+    df[segment_col_name] = pd.cut(
+        x=df[feature].dropna(),
+        labels=labels,
+        bins=segments,
+        right=True,
+        include_lowest=True
+    )
+
+    special_labels = []
+    if special_values:
+        for special_value in special_values:
+            label = str(special_value)
+
+            special_labels.append(label)
+
+        new_categories = [
+            label
+            for label in special_labels
+            if label not in df[segment_col_name].cat.categories
+        ]
+
+        df[segment_col_name] = (
+            df[segment_col_name]
+            .cat.add_categories(new_categories)
+        )
+
+        for special_value in special_values:
+            mask = df[feature].eq(special_value)
+            label = str(special_value)
+
+            df.loc[mask, segment_col_name] = label
+
+    cols = pd.get_dummies(
+        df[segment_col_name],
+        prefix=f"{feature}"
+    )
+
+    return cols
+    
+
+--- markdown cell ---
+## Функция подготовки датасета
+
+--- code cell ---
+def prepare_dataset(
+    data: pd.DataFrame,
+    features: list[str],
+    segmentss: list[list[float]],
+    special_valuess: list[list[float]]
+) -> pd.DataFrame:
+    df = data.copy(deep=True)
+
+    for feature, segments, special_values in zip(
+        features,
+        segmentss,
+        special_valuess
+    ):
+        cols = make_segments_cols(
+            data=df,
+            feature=feature,
+            segments=segments,
+            special_values=special_values
+        )
+
+        df = df.drop(columns=feature)
+        df = pd.concat([df, cols], axis=1)
+
+    return df
+
+--- markdown cell ---
+## Функция оценки модели
+
+--- code cell ---
+def evaluate_model(
+    model,
+    X_test: pd.DataFrame,
+    y_test: pd.Series
+) -> tuple[float, float, float, float, float]:
+    y_predict = model.predict(X_test)
+    y_predict_score = model.predict_proba(X_test)[:, 1]
+
+    precision = precision_score(y_test, y_predict)
+    recall = recall_score(y_test, y_predict)
+    roc_auc = roc_auc_score(y_test, y_predict_score)
+    pr_auc = average_precision_score(y_test, y_predict_score)
+    gini = 2 * roc_auc - 1
+
+    return (precision, recall, roc_auc, gini, pr_auc)
+
+--- markdown cell ---
+# Загрузка датасета
+
+--- code cell ---
+data = pd.read_csv("../data/interim/borrowers.csv")
+
+--- markdown cell ---
+# Цель
+
+--- markdown cell ---
+Цель данного ноутбука - научиться оценивать надёжность заёмщиков, чтобы как можно полно отсеять плохих заёмщиков и сохранить хороших.
+
+Чтобы этого достичь, нужно решить следующие задачи:
+1. Подготовить данные для моделей;
+2. Подобрать гиперпараметры для моделей;
+3. Обучить модели;
+4. Оценить качество полученных моделей;
+5. Проинтерпретировать веса логистической регрессии.
+
+--- markdown cell ---
+# Методология
+
+--- markdown cell ---
+**1. Подготовка данных:**
+
+Так как будут использоваться линейные и древовидные модели, то имеет смысл готовить отдельный тип датасета под каждый тип модели. То есть для линейных моделей будет усместна дискретизация признаков на несколько новых (соответствующих сегментам значений признака), а для градиентного бустинга от CatBoost ничего принимать не стоит.
+
+Таким образом, для линейных моделей выполним дискретизацию, а для градиентного бустинга оставим исходный датасет.
+
+**2. Подбор гиперпараметров:**
+
+При помощи optuna подберём гиперпараметры для логистической регрессии и CatBoostClassifier. Прежде всего стоит обращать внимание на метрику ROC-AUC  так как она лучше учитывает дисбаланс классов.
+
+**3. Обучение моделей:**
+
+На подобранных гиперпараметрах, нужно произвести обучение моделей.
+
+**4. Оценка качества моделей:**
+
+На оставленной hold-out выборке произвести оценку качества моделей, прежде всего при помощи метрик ROC-AUC, PR-AUC, Gini, precision и recall нужно оценить качество моделей, а также сравнить модели между собой и принять решение о том стоит ли выбирать более сложную модель в угоду качеству (если она, конечно, отличается по качеству в положительную сторону).
+
+**5. Интерпретация весов логистической регрессии:**
+
+Для валидации модели стоит проинтерпретировать веса логистической регресии, чтобы понять насколько молель адекватно откликается на обнаруженные при анализе сегменты и маркеры риска.
+
+--- markdown cell ---
+# Подготовка признаков
+
+--- markdown cell ---
+Сегменты признаков и их специальные значения.
+
+--- code cell ---
+features = [
+    "revolving_utilization",
+    "age",
+    "num_30_59_days_late",
+    "debt_ratio",
+    "monthly_income",
+    "num_open_credit_lines",
+    "num_90_days_late",
+    "num_real_estate_loans",
+    "num_60_89_days_late",
+    "num_dependents"
+]
+
+segmentss = [
+    [0.0, 0.2, 0.4, 0.5, 0.7, 1.0, 2.0, 5.0, np.inf],
+    [0.0, 22.0, 30.0, 45.0, 55.0, 75.0, np.inf],
+    [1, 2, np.inf],
+    [0.0, 0.1, 0.7, 1.0, 4.0, np.inf],
+    [0.0, 900.0, 3000.0, 4500.0, 6500.0, 13000.0, np.inf],
+    [1, 2, np.inf],
+    [1, 2, np.inf],
+    [1, 3, np.inf],
+    [1, 2, np.inf],
+    [1, 2, np.inf]
+]
+
+special_valuess = [
+    [],
+    [],
+    [0, 96, 98],
+    [0],
+    [],
+    [0],
+    [0, 96, 98],
+    [0],
+    [0, 96, 98],
+    [0]
+]
+
+--- markdown cell ---
+Подготовка признаков.
+
+--- code cell ---
+transformed_data = prepare_dataset(
+    data=data,
+    features=features,
+    segmentss=segmentss,
+    special_valuess=special_valuess
+)
+
+--- markdown cell ---
+Разделение данных на train и test.
+
+--- code cell ---
+X = data.drop(columns="target").fillna(-1)
+y = data["target"]
+
+X_transformed = transformed_data.drop(columns="target")
+y_transformed = transformed_data["target"]
+
+--- code cell ---
+X_train, X_test, y_train, y_test = train_test_split(
+    X,
+    y,
+    test_size=0.3,
+    shuffle=True,
+    random_state=42,
+    stratify=y
+)
+
+X_t_train, X_t_test, y_t_train, y_t_test = train_test_split(
+    X_transformed,
+    y_transformed,
+    test_size=0.3,
+    shuffle=True,
+    random_state=42,
+    stratify=y_transformed
+)
+
+--- markdown cell ---
+# Подбор гиперпараметров
+
+--- markdown cell ---
+## Подбор гиперпараметров для логистической регрессии
+
+--- markdown cell ---
+Функция вычисления оптимальных гиперпараметров.
+
+--- code cell ---
+def objective(trial):
+    C = trial.suggest_float(
+        "C",
+        1e-3,
+        10,
+        log=True
+    )
+
+    class_weight = trial.suggest_categorical(
+        "class_weight",
+        [None, "balanced"]
+    )
+
+    model = LogisticRegression(
+        solver="lbfgs",
+        penalty="l2",
+        C=C,
+        class_weight=class_weight,
+        max_iter=1000,
+        random_state=42
+    )
+
+    cv = StratifiedKFold(
+        n_splits=5,
+        shuffle=True,
+        random_state=42
+    )
+
+    score = cross_val_score(
+        model,
+        X_t_train,
+        y_t_train,
+        cv=cv,
+        scoring="roc_auc",
+        n_jobs=-1
+    ).mean()
+
+    return score
+
+--- markdown cell ---
+Подбор гиперпараметров.
+
+--- code cell ---
+study = optuna.create_study(direction="maximize")
+
+study.optimize(
+    objective,
+    n_trials=20
+)
+
+--- markdown cell ---
+Сохранение оптимальных гиперпараметров.
+
+--- code cell ---
+logistic_regression_best_params = study.best_params
+
+--- markdown cell ---
+## Подбор параметров для CatBoostClassifier
+
+--- markdown cell ---
+Функция вычисления оптимальных гиперпараметров.
+
+--- code cell ---
+def objective(trial):
+    model = CatBoostClassifier(
+        iterations=trial.suggest_int(
+            "iterations",
+            300,
+            700,
+            step=100
+        ),
+
+        learning_rate=trial.suggest_float(
+            "learning_rate",
+            0.02,
+            0.08,
+            log=True
+        ),
+
+        depth=trial.suggest_int(
+            "depth",
+            4,
+            7
+        ),
+
+        l2_leaf_reg=trial.suggest_float(
+            "l2_leaf_reg",
+            3,
+            12,
+            log=True
+        ),
+
+        auto_class_weights=trial.suggest_categorical(
+            "auto_class_weights",
+            [None, "SqrtBalanced"]
+        ),
+
+        random_strength=1,
+
+        loss_function="Logloss",
+        random_seed=42,
+        verbose=False,
+        thread_count=1
+    )
+
+    cv = StratifiedKFold(
+        n_splits=5,
+        shuffle=True,
+        random_state=42
+    )
+
+    scores = cross_val_score(
+        model,
+        X_train,
+        y_train,
+        cv=cv,
+        scoring="roc_auc",
+        n_jobs=-1
+    )
+
+    return scores.mean()
+
+--- markdown cell ---
+Подбор гиперпараметров.
+
+--- code cell ---
+study = optuna.create_study(direction="maximize")
+
+study.optimize(
+    objective,
+    n_trials=20
+)
+
+--- markdown cell ---
+Сохранение оптимальных гиперпараметров.
+
+--- code cell ---
+catboost_best_params = study.best_params
+
+--- markdown cell ---
+# Обучение моделей с подобранными оптимальными гиперпараметрами
+
+--- markdown cell ---
+**Обучение логистической регрессии.**
+
+--- code cell ---
+log_reg = LogisticRegression(**logistic_regression_best_params)
+
+--- code cell ---
+log_reg.fit(X_t_train, y_t_train)
+
+--- markdown cell ---
+**Обучение CatBoost классификатора.**
+
+--- code cell ---
+cat_classifier = CatBoostClassifier(**catboost_best_params)
+
+--- code cell ---
+cat_classifier.fit(X_train, y_train)
+
+--- markdown cell ---
+# Оценка качества моделей
+
+--- markdown cell ---
+**Сводная таблица качества моделей.**
+
+--- code cell ---
+models_metrics = pd.DataFrame(columns=[
+    "model",
+    "precision",
+    "recall",
+    "roc_auc",
+    "pr_auc",
+    "gini"
+])
+
+--- markdown cell ---
+**Вычисление метрик качества логистической регрессии.**
+
+--- code cell ---
+log_reg_metrics = evaluate_model(
+    model=log_reg,
+    X_test=X_t_test,
+    y_test=y_t_test
+)
+
+--- code cell ---
+log_reg_metrics
+
+--- code cell ---
+models_metrics.loc[ models_metrics.shape[0] ] = ("logistic regression",) + log_reg_metrics
+
+--- markdown cell ---
+**Вычисление метрик качества CatBoostClassifier.**
+
+--- code cell ---
+cat_clsfr = evaluate_model(
+    model=cat_classifier,
+    X_test=X_test,
+    y_test=y_test
+)
+
+--- code cell ---
+cat_clsfr
+
+--- code cell ---
+models_metrics.loc[ models_metrics.shape[0] ] = ("catboost classifier",) + cat_clsfr
+
+--- markdown cell ---
+**Вычисление разницы метрик между моделями.**
+
+--- code cell ---
+models_metrics.loc[ models_metrics.shape[0] ] = [
+    "delta",
+    models_metrics.iloc[1, 1] - models_metrics.iloc[0, 1],
+    models_metrics.iloc[1, 2] - models_metrics.iloc[0, 2],
+    models_metrics.iloc[1, 3] - models_metrics.iloc[0, 3],
+    models_metrics.iloc[1, 4] - models_metrics.iloc[0, 4],
+    models_metrics.iloc[1, 5] - models_metrics.iloc[0, 5]
+]
+
+--- code cell ---
+models_metrics
+
+
+
+============================================================
 src\scripts\__init__.py
 ============================================================
 
@@ -4218,7 +4738,7 @@ def prepare_analytical_dataset() -> None:
     data_quality_prepare(data_path=data_path, out_path=output_path)
 
 ============================================================
-src\sql_analysis\01_portfolio_overview.sql
+src\sql_analysis\01_data_overview.sql
 ============================================================
 
 --------------------------------------------------------------
@@ -4360,7 +4880,7 @@ FROM borrowers;
 --02-5-- Наличие логически несовместимых значений признаков
 --------------------------------------------------------------
 SELECT
-    SUM(CASE WHEN revolving_utilization > 0 AND num_open_credit_lines = 0 THEN 1 ELSE 0 END) AS invalid_rev_ut_AND_num_op_cr_lines,
+    SUM(CASE WHEN revolving_utilization > 0 AND num_open_credit_lines = 0 THEN 1 ELSE 0 END) AS potentially_inconsistent_rev_util_credit_lines,
     SUM(CASE WHEN num_open_credit_lines < num_real_estate_loans THEN 1 ELSE 0 END) AS invalid_num_op_cr_lines_AND_num_r_es_loans
 FROM borrowers;
 --------------------------------------------------------------
@@ -4374,6 +4894,7 @@ SELECT SUM (
         WHEN num_60_89_days_late = 98 THEN 1
         WHEN num_90_days_late = 96 THEN 1
         WHEN num_90_days_late = 98 THEN 1
+        ELSE 0
     END
 ) AS rows_with_special_codes
 FROM borrowers;
@@ -4386,11 +4907,13 @@ SELECT
             WHEN num_30_59_days_late = 96 OR num_30_59_days_late = 98 THEN 1
             WHEN num_60_89_days_late = 96 OR num_60_89_days_late = 98 THEN 1
             WHEN num_90_days_late = 96 OR num_90_days_late = 98 THEN 1
+            ELSE 0
         END
     ) - SUM (
         CASE
             WHEN num_30_59_days_late = 96 AND num_60_89_days_late = 96 AND num_90_days_late = 96 THEN 1
             WHEN num_30_59_days_late = 98 AND num_60_89_days_late = 98 AND num_90_days_late = 98 THEN 1
+            ELSE 0
         END
     ) AS not_consistency_special_codes
 FROM borrowers;
@@ -4432,11 +4955,11 @@ FROM borrowers
 SELECT
     segment, 
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     SUM(target) AS bads,
     AVG(target) AS bad_rate
 FROM dpd_segments
-GROUP BY segment
+GROUP BY segment, severity_order
 ORDER BY severity_order;
 --------------------------------------------------------------
 --03-2-- Сегменты клиентов с разными просрочками
@@ -4483,12 +5006,12 @@ FROM borrowers
 SELECT 
     segment, 
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     SUM(target) AS bads,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM dpd_segments
-GROUP BY segment
+GROUP BY segment, severity_order
 ORDER BY severity_order;
 --------------------------------------------------------------
 --03-3-- Сегменты клиентов с разными просрочками (модифицированный вариант)
@@ -4566,13 +5089,13 @@ FROM borrowers
 SELECT 
     segment, 
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     SUM(target) AS bads,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift,
     SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share
 FROM dpd_segments
-GROUP BY segment
+GROUP BY segment, severity_order
 ORDER BY severity_order;
 --------------------------------------------------------------
 --03-4-- Кумулятивный охват bad borrowers по сегментам просрочек
@@ -4580,15 +5103,15 @@ ORDER BY severity_order;
 WITH dpd_segments AS (
 SELECT
     CASE
-        WHEN num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) THEN '30-59 DPD'
-        WHEN num_60_89_days_late > 0 AND num_60_89_days_late NOT IN (96, 98) THEN '60-89 DPD'
         WHEN num_90_days_late > 0 AND num_90_days_late NOT IN (96, 98) THEN '90+ DPD'
+        WHEN num_60_89_days_late > 0 AND num_60_89_days_late NOT IN (96, 98) THEN '60-89 DPD'
+        WHEN num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) THEN '30-59 DPD'
         ELSE 'No DPD OR Special Codes'
     END AS segment,
     CASE
-        WHEN num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) THEN 1
+        WHEN num_90_days_late > 0 AND num_90_days_late NOT IN (96, 98) THEN 1
         WHEN num_60_89_days_late > 0 AND num_60_89_days_late NOT IN (96, 98) THEN 2
-        WHEN num_90_days_late > 0 AND num_90_days_late NOT IN (96, 98) THEN 3
+        WHEN num_30_59_days_late > 0 AND num_30_59_days_late NOT IN (96, 98) THEN 3
         ELSE 4
     END AS severity_order,
     target
@@ -4597,9 +5120,12 @@ FROM borrowers
 SELECT 
     segment, 
     SUM(COUNT(*)) OVER(ORDER BY severity_order ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_borrowers,
-    SUM(SUM(target)) OVER(ORDER BY severity_order ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_bads
+    SUM(SUM(target)) OVER(ORDER BY severity_order ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) cumulative_bads,
+    SUM(SUM(target)) OVER(ORDER BY severity_order ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) * 1.0 /
+    SUM(SUM(target)) OVER()AS cumulative_bads_share
 FROM dpd_segments
-GROUP BY segment;
+GROUP BY segment, severity_order
+ORDER BY severity_order;
 
 ============================================================
 src\sql_analysis\04_risk_segments.sql
@@ -4636,11 +5162,11 @@ FROM borrowers
 SELECT
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM revolving_utilization_segments
-GROUP BY segment
+GROUP BY segment, severity_order
 ORDER BY severity_order;
 --------------------------------------------------------------
 --04-2-- Age risk segments
@@ -4669,11 +5195,11 @@ FROM borrowers
 SELECT
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM age_segments
-GROUP BY segment
+GROUP BY segment, severity_order
 ORDER BY severity_order;
 --------------------------------------------------------------
 --04-3-- 30-59 DPD risk segments
@@ -4700,11 +5226,11 @@ FROM borrowers
 SELECT
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM DPD_30_59_segments
-GROUP BY segment
+GROUP BY segment, severity_order
 ORDER BY severity_order;
 --------------------------------------------------------------
 --04-4-- Debt Ratio DPD risk segments
@@ -4731,11 +5257,11 @@ FROM borrowers
 SELECT
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM debt_ratio_segments
-GROUP BY segment
+GROUP BY segment, severity_order
 ORDER BY severity_order;
 --------------------------------------------------------------
 --04-5-- Monthly Income DPD risk segments
@@ -4766,11 +5292,11 @@ FROM borrowers
 SELECT
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM monthly_income_segments
-GROUP BY segment
+GROUP BY segment, severity_order
 ORDER BY severity_order;
 --------------------------------------------------------------
 --04-6-- Num Open Credit Lines DPD risk segments
@@ -4793,11 +5319,11 @@ FROM borrowers
 SELECT
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM num_open_credit_lines_segments
-GROUP BY segment
+GROUP BY segment, severity_order
 ORDER BY severity_order;
 --------------------------------------------------------------
 --04-7-- 90+ DPD risk segments
@@ -4824,11 +5350,11 @@ FROM borrowers
 SELECT
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM DPD_90_segments
-GROUP BY segment
+GROUP BY segment, severity_order
 ORDER BY severity_order;
 --------------------------------------------------------------
 --04-8-- Num Real Estate Loans DPD risk segments
@@ -4851,11 +5377,11 @@ FROM borrowers
 SELECT
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM num_real_estate_loans_segments
-GROUP BY segment
+GROUP BY segment, severity_order
 ORDER BY severity_order;
 --------------------------------------------------------------
 --04-9-- 60-89 DPD risk segments
@@ -4882,11 +5408,11 @@ FROM borrowers
 SELECT
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM DPD_60_89_segments
-GROUP BY segment
+GROUP BY segment, severity_order
 ORDER BY severity_order;
 --------------------------------------------------------------
 --04-10-- Num Dependents DPD risk segments
@@ -4911,11 +5437,11 @@ FROM borrowers
 SELECT
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM num_dependents_segments
-GROUP BY segment
+GROUP BY segment, severity_order
 ORDER BY severity_order;
 --------------------------------------------------------------
 --04-11-- Общая агрегационная таблица
@@ -5112,117 +5638,117 @@ SELECT
     target
 FROM borrowers
 )
-SELECT feature, segment, borrowers, portfolio_share, bad_rate, lift
+SELECT feature, segment, borrowers, borrowers_share, bad_rate, lift
 FROM (
 SELECT
     'revolving_utilization' AS feature,
     severity_order,
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM revolving_utilization_segments
-GROUP BY segment
-UNION
+GROUP BY segment, severity_order
+UNION ALL
 SELECT
     'age' AS feature,
     severity_order,
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM age_segments
-GROUP BY segment
-UNION
+GROUP BY segment, severity_order
+UNION ALL
 SELECT
     'DPD_30_59' AS feature,
     severity_order,
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM DPD_30_59_segments
-GROUP BY segment
-UNION
+GROUP BY segment, severity_order
+UNION ALL
 SELECT
     'debt_ratio' AS feature,
     severity_order,
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM debt_ratio_segments
-GROUP BY segment
-UNION
+GROUP BY segment, severity_order
+UNION ALL
 SELECT
     'monthly_income' AS feature,
     severity_order,
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM monthly_income_segments
-GROUP BY segment
-UNION
+GROUP BY segment, severity_order
+UNION ALL
 SELECT
     'num_open_credit_lines' AS feature,
     severity_order,
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM num_open_credit_lines_segments
-GROUP BY segment
-UNION
+GROUP BY segment, severity_order
+UNION ALL
 SELECT
     'DPD_90' AS feature,
     severity_order,
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM DPD_90_segments
-GROUP BY segment
-UNION
+GROUP BY segment, severity_order
+UNION ALL
 SELECT
     'num_real_estate_loans' AS feature,
     severity_order,
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM num_real_estate_loans_segments
-GROUP BY segment
-UNION
+GROUP BY segment, severity_order
+UNION ALL
 SELECT
     'DPD_60_89' AS feature,
     severity_order,
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM DPD_60_89_segments
-GROUP BY segment
-UNION
+GROUP BY segment, severity_order
+UNION ALL
 SELECT
     'num_dependents' AS feature,
     severity_order,
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM num_dependents_segments
-GROUP BY segment
+GROUP BY segment, severity_order
 ) AS t
 ORDER BY feature, severity_order;
 
@@ -5429,148 +5955,145 @@ SELECT
     target
 FROM borrowers
 )
-SELECT feature, segment, borrowers, portfolio_share, bads, bad_share, bad_rate, lift
+SELECT feature, segment, borrowers, borrowers_share, bads, bad_share, bad_rate, lift
 FROM (
 SELECT
     'revolving_utilization' AS feature,
     severity_order,
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     SUM(target) AS bads,
     SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM revolving_utilization_segments
-GROUP BY segment
-UNION
+GROUP BY segment, severity_order
+UNION ALL
 SELECT
     'age' AS feature,
     severity_order,
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     SUM(target) AS bads,
     SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM age_segments
-GROUP BY segment
-UNION
+GROUP BY segment, severity_order
+UNION ALL
 SELECT
     'DPD_30_59' AS feature,
     severity_order,
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     SUM(target) AS bads,
     SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM DPD_30_59_segments
-GROUP BY segment
-UNION
+GROUP BY segment, severity_order
+UNION ALL
 SELECT
     'debt_ratio' AS feature,
     severity_order,
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     SUM(target) AS bads,
     SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM debt_ratio_segments
-GROUP BY segment
-UNION
+GROUP BY segment, severity_order
+UNION ALL
 SELECT
     'monthly_income' AS feature,
     severity_order,
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     SUM(target) AS bads,
     SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM monthly_income_segments
-GROUP BY segment
-UNION
+GROUP BY segment, severity_order
+UNION ALL
 SELECT
     'num_open_credit_lines' AS feature,
     severity_order,
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     SUM(target) AS bads,
     SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM num_open_credit_lines_segments
-GROUP BY segment
-UNION
+GROUP BY segment, severity_order
+UNION ALL
 SELECT
     'DPD_90' AS feature,
     severity_order,
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     SUM(target) AS bads,
     SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM DPD_90_segments
-GROUP BY segment
-UNION
+GROUP BY segment, severity_order
+UNION ALL
 SELECT
     'num_real_estate_loans' AS feature,
     severity_order,
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     SUM(target) AS bads,
     SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM num_real_estate_loans_segments
-GROUP BY segment
-UNION
+GROUP BY segment, severity_order
+UNION ALL
 SELECT
     'DPD_60_89' AS feature,
     severity_order,
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     SUM(target) AS bads,
     SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM DPD_60_89_segments
-GROUP BY segment
-UNION
+GROUP BY segment, severity_order
+UNION ALL
 SELECT
     'num_dependents' AS feature,
     severity_order,
     segment,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS portfolio_share,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     SUM(target) AS bads,
     SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM num_dependents_segments
-GROUP BY segment
+GROUP BY segment, severity_order
 ) AS t
 ORDER BY feature, severity_order;
 --------------------------------------------------------------
 --------------------------------------------------------------
 --------------------------------------------------------------
--- Ранжирование по bad contribution и bad rate
+--05-2 Ранжирование сегментов признаков по bad contribution и bad rate
 --------------------------------------------------------------
 --------------------------------------------------------------
---------------------------------------------------------------
---------------------------------------------------------------
---05-2-- Revolving Utilization
 --------------------------------------------------------------
 WITH revolving_utilization_segments AS(
 SELECT
@@ -5596,20 +6119,8 @@ SELECT
     END AS severity_order,
     target
 FROM borrowers
-)
-SELECT
-    RANK() OVER(ORDER BY SUM(target) DESC) AS bad_rate_rank,
-    RANK() OVER(ORDER BY AVG(target) DESC) AS bad_contribution_rank,
-    segment,
-    SUM(target) AS bads,
-    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bads_share
-FROM revolving_utilization_segments
-GROUP BY segment
-ORDER BY severity_order;
---------------------------------------------------------------
---05-3-- Age
---------------------------------------------------------------
-WITH age_segments AS(
+),
+age_segments AS(
 SELECT
     CASE
         WHEN age >= 0.0 AND age <= 22.0 THEN '[0.0, 22.0]'
@@ -5629,20 +6140,8 @@ SELECT
     END AS severity_order,
     target
 FROM borrowers
-)
-SELECT
-    RANK() OVER(ORDER BY SUM(target) DESC) AS bad_rate_rank,
-    RANK() OVER(ORDER BY AVG(target) DESC) AS bad_contribution_rank,
-    segment,
-    SUM(target) AS bads,
-    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bads_share
-FROM age_segments
-GROUP BY segment
-ORDER BY severity_order;
---------------------------------------------------------------
---05-4-- 30-59 DPD
---------------------------------------------------------------
-WITH DPD_30_59_segments AS(
+),
+DPD_30_59_segments AS(
 SELECT
     CASE
         WHEN num_30_59_days_late = 0 THEN '0'
@@ -5660,20 +6159,8 @@ SELECT
     END AS severity_order,
     target
 FROM borrowers
-)
-SELECT
-    RANK() OVER(ORDER BY SUM(target) DESC) AS bad_rate_rank,
-    RANK() OVER(ORDER BY AVG(target) DESC) AS bad_contribution_rank,
-    segment,
-    SUM(target) AS bads,
-    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bads_share
-FROM DPD_30_59_segments
-GROUP BY segment
-ORDER BY severity_order;
---------------------------------------------------------------
---05-5-- Debt Ratio DPD
---------------------------------------------------------------
-WITH debt_ratio_segments AS(
+),
+debt_ratio_segments AS(
 SELECT
     CASE
         WHEN debt_ratio >= 0.0 AND debt_ratio <= 0.1 THEN '[0.0, 0.1]'
@@ -5691,20 +6178,8 @@ SELECT
     END AS severity_order,
     target
 FROM borrowers
-)
-SELECT
-    RANK() OVER(ORDER BY SUM(target) DESC) AS bad_rate_rank,
-    RANK() OVER(ORDER BY AVG(target) DESC) AS bad_contribution_rank,
-    segment,
-    SUM(target) AS bads,
-    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bads_share
-FROM debt_ratio_segments
-GROUP BY segment
-ORDER BY severity_order;
---------------------------------------------------------------
---05-6-- Monthly Income DPD
---------------------------------------------------------------
-WITH monthly_income_segments AS(
+),
+monthly_income_segments AS(
 SELECT
     CASE
         WHEN monthly_income >= 0.0 AND monthly_income <= 900.0 THEN '[0.0, 900.0]'
@@ -5726,20 +6201,8 @@ SELECT
     END AS severity_order,
     target
 FROM borrowers
-)
-SELECT
-    RANK() OVER(ORDER BY SUM(target) DESC) AS bad_rate_rank,
-    RANK() OVER(ORDER BY AVG(target) DESC) AS bad_contribution_rank,
-    segment,
-    SUM(target) AS bads,
-    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bads_share
-FROM monthly_income_segments
-GROUP BY segment
-ORDER BY severity_order;
---------------------------------------------------------------
---05-7-- Num Open Credit Lines DPD
---------------------------------------------------------------
-WITH num_open_credit_lines_segments AS(
+),
+num_open_credit_lines_segments AS(
 SELECT
     CASE
         WHEN num_open_credit_lines = 0 THEN '0'
@@ -5753,20 +6216,8 @@ SELECT
     END AS severity_order,
     target
 FROM borrowers
-)
-SELECT
-    RANK() OVER(ORDER BY SUM(target) DESC) AS bad_rate_rank,
-    RANK() OVER(ORDER BY AVG(target) DESC) AS bad_contribution_rank,
-    segment,
-    SUM(target) AS bads,
-    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bads_share
-FROM num_open_credit_lines_segments
-GROUP BY segment
-ORDER BY severity_order;
---------------------------------------------------------------
---05-8-- 90+ DPD
---------------------------------------------------------------
-WITH DPD_90_segments AS(
+),
+DPD_90_segments AS(
 SELECT
     CASE
         WHEN num_90_days_late = 0 THEN '0'
@@ -5784,20 +6235,8 @@ SELECT
     END AS severity_order,
     target
 FROM borrowers
-)
-SELECT
-    RANK() OVER(ORDER BY SUM(target) DESC) AS bad_rate_rank,
-    RANK() OVER(ORDER BY AVG(target) DESC) AS bad_contribution_rank,
-    segment,
-    SUM(target) AS bads,
-    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bads_share
-FROM DPD_90_segments
-GROUP BY segment
-ORDER BY severity_order;
---------------------------------------------------------------
---05-9-- Num Real Estate Loans
---------------------------------------------------------------
-WITH num_real_estate_loans_segments AS(
+),
+num_real_estate_loans_segments AS(
 SELECT
     CASE
         WHEN num_real_estate_loans = 0 THEN '0'
@@ -5811,20 +6250,8 @@ SELECT
     END AS severity_order,
     target
 FROM borrowers
-)
-SELECT
-    RANK() OVER(ORDER BY SUM(target) DESC) AS bad_rate_rank,
-    RANK() OVER(ORDER BY AVG(target) DESC) AS bad_contribution_rank,
-    segment,
-    SUM(target) AS bads,
-    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bads_share
-FROM num_real_estate_loans_segments
-GROUP BY segment
-ORDER BY severity_order;
---------------------------------------------------------------
---05-10-- 60-89 DPD
---------------------------------------------------------------
-WITH DPD_60_89_segments AS(
+),
+DPD_60_89_segments AS(
 SELECT
     CASE
         WHEN num_60_89_days_late = 0 THEN '0'
@@ -5842,20 +6269,8 @@ SELECT
     END AS severity_order,
     target
 FROM borrowers
-)
-SELECT
-    RANK() OVER(ORDER BY SUM(target) DESC) AS bad_rate_rank,
-    RANK() OVER(ORDER BY AVG(target) DESC) AS bad_contribution_rank,
-    segment,
-    SUM(target) AS bads,
-    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bads_share
-FROM DPD_60_89_segments
-GROUP BY segment
-ORDER BY severity_order;
---------------------------------------------------------------
---05-11-- Num Dependents
---------------------------------------------------------------
-WITH num_dependents_segments AS(
+),
+num_dependents_segments AS(
 SELECT
     CASE
         WHEN num_dependents = 0 THEN '0'
@@ -5871,20 +6286,162 @@ SELECT
     END AS severity_order,
     target
 FROM borrowers
-)
+),
+segment_metrics AS (
+SELECT feature, segment, borrowers, borrowers_share, bads, bad_share, bad_rate, lift
+FROM (
 SELECT
-    RANK() OVER(ORDER BY SUM(target) DESC) AS bad_rate_rank,
-    RANK() OVER(ORDER BY AVG(target) DESC) AS bad_contribution_rank,
+    'revolving_utilization' AS feature,
+    severity_order,
     segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
     SUM(target) AS bads,
-    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bads_share
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM revolving_utilization_segments
+GROUP BY segment, severity_order
+UNION ALL
+SELECT
+    'age' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM age_segments
+GROUP BY segment, severity_order
+UNION ALL
+SELECT
+    'DPD_30_59' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM DPD_30_59_segments
+GROUP BY segment, severity_order
+UNION ALL
+SELECT
+    'debt_ratio' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM debt_ratio_segments
+GROUP BY segment, severity_order
+UNION ALL
+SELECT
+    'monthly_income' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM monthly_income_segments
+GROUP BY segment, severity_order
+UNION ALL
+SELECT
+    'num_open_credit_lines' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM num_open_credit_lines_segments
+GROUP BY segment, severity_order
+UNION ALL
+SELECT
+    'DPD_90' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM DPD_90_segments
+GROUP BY segment, severity_order
+UNION ALL
+SELECT
+    'num_real_estate_loans' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM num_real_estate_loans_segments
+GROUP BY segment, severity_order
+UNION ALL
+SELECT
+    'DPD_60_89' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
+FROM DPD_60_89_segments
+GROUP BY segment, severity_order
+UNION ALL
+SELECT
+    'num_dependents' AS feature,
+    severity_order,
+    segment,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER() AS borrowers_share,
+    SUM(target) AS bads,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER() AS bad_share,
+    AVG(target) AS bad_rate,
+    AVG(target) / (SUM(SUM(target)) OVER() * 1.0 / SUM(COUNT(*)) OVER()) AS lift
 FROM num_dependents_segments
-GROUP BY segment
-ORDER BY severity_order;
+GROUP BY segment, severity_order
+) AS t
+ORDER BY feature, severity_order
+),
+ranked AS (
+    SELECT
+        *,
+        RANK() OVER (
+            PARTITION BY feature
+            ORDER BY bad_rate DESC
+        ) AS bad_rate_rank,
+        RANK() OVER (
+            PARTITION BY feature
+            ORDER BY bads DESC
+        ) AS bad_contribution_rank
+    FROM segment_metrics
+)
+SELECT *
+FROM ranked
+ORDER BY feature, bad_rate_rank;
 --------------------------------------------------------------
 --------------------------------------------------------------
 --------------------------------------------------------------
---5-12 Risk markers
+--5-3 Risk markers
 --------------------------------------------------------------
 --------------------------------------------------------------
 --------------------------------------------------------------
@@ -5901,7 +6458,7 @@ SELECT
              THEN 1 ELSE 0
     END AS has_previous_dpd,
     CASE
-        WHEN debt_ratio > 0.7 AND debt_ratio < 4.0 THEN 1 ELSE 0
+        WHEN debt_ratio > 0.7 AND debt_ratio <= 4.0 THEN 1 ELSE 0
     END AS high_debt_ratio,
     CASE
         WHEN num_open_credit_lines = 0 THEN 1 ELSE 0
@@ -5913,7 +6470,7 @@ FROM risk_markers;
 --------------------------------------------------------------
 --------------------------------------------------------------
 --------------------------------------------------------------
---5-13 Risk markers count
+--5-4 Risk markers report
 --------------------------------------------------------------
 --------------------------------------------------------------
 --------------------------------------------------------------
@@ -5927,7 +6484,7 @@ FROM borrowers
 SELECT
     'high_utilization' as marker,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / (SELECT size FROM base_metrics) AS portfolio_share,
+    COUNT(*) * 1.0 / (SELECT size FROM base_metrics) AS borrowers_share,
     SUM(target) AS bads,
     SUM(target) * 1.0 / (SELECT bads FROM base_metrics) AS bads_share,
     AVG(target) AS bad_rate,
@@ -5938,7 +6495,7 @@ UNION
 SELECT
     'has_previous_dpd' as marker,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / (SELECT size FROM base_metrics) AS portfolio_share,
+    COUNT(*) * 1.0 / (SELECT size FROM base_metrics) AS borrowers_share,
     SUM(target) AS bads,
     SUM(target) * 1.0 / (SELECT bads FROM base_metrics) AS bads_share,
     AVG(target) AS bad_rate,
@@ -5953,18 +6510,18 @@ UNION
 SELECT
     'high_debt_ratio' as marker,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / (SELECT size FROM base_metrics) AS portfolio_share,
+    COUNT(*) * 1.0 / (SELECT size FROM base_metrics) AS borrowers_share,
     SUM(target) AS bads,
     SUM(target) * 1.0 / (SELECT bads FROM base_metrics) AS bads_share,
     AVG(target) AS bad_rate,
     AVG(target) / (SELECT bad_rate FROM base_metrics) AS lift
 FROM borrowers
-WHERE debt_ratio > 0.7 AND debt_ratio < 4.0
+WHERE debt_ratio > 0.7 AND debt_ratio <= 4.0
 UNION
 SELECT
     'hasnt_credit_lines' as marker,
     COUNT(*) AS borrowers,
-    COUNT(*) * 1.0 / (SELECT size FROM base_metrics) AS portfolio_share,
+    COUNT(*) * 1.0 / (SELECT size FROM base_metrics) AS borrowers_share,
     SUM(target) AS bads,
     SUM(target) * 1.0 / (SELECT bads FROM base_metrics) AS bads_share,
     AVG(target) AS bad_rate,
@@ -5990,6 +6547,66 @@ SELECT
     type AS data_type
 FROM pragma_table_info('borrowers')
 ORDER BY cid;
+"""
+
+--- code cell ---
+query = """
+WITH risk_markers AS (
+    SELECT
+        target,
+
+        CASE
+            WHEN revolving_utilization > 0.7
+             AND revolving_utilization <= 2.0
+            THEN 1 ELSE 0
+        END AS high_utilization,
+
+        CASE
+            WHEN (...)
+            THEN 1 ELSE 0
+        END AS has_previous_dpd,
+
+        CASE
+            WHEN debt_ratio > 0.7
+             AND debt_ratio <= 4.0
+            THEN 1 ELSE 0
+        END AS high_debt_ratio,
+
+        CASE
+            WHEN num_open_credit_lines = 0
+            THEN 1 ELSE 0
+        END AS no_open_credit_lines
+
+    FROM borrowers
+),
+
+marker_counts AS (
+    SELECT
+        target,
+
+        high_utilization
+        + has_previous_dpd
+        + high_debt_ratio
+        + no_open_credit_lines
+            AS risk_marker_count
+
+    FROM risk_markers
+)
+
+SELECT
+    risk_marker_count,
+    COUNT(*) AS borrowers,
+    COUNT(*) * 1.0 / SUM(COUNT(*)) OVER ()
+        AS portfolio_share,
+    SUM(target) AS bads,
+    AVG(target) AS bad_rate,
+    SUM(target) * 1.0 / SUM(SUM(target)) OVER ()
+        AS bad_share
+
+FROM marker_counts
+
+GROUP BY risk_marker_count
+ORDER BY risk_marker_count;
 """
 
 --- code cell ---

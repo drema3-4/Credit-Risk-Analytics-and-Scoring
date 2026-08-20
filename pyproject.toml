@@ -14,7 +14,10 @@ dependencies = [
     "jupyter (>=1.1.1,<2.0.0)",
     "statsmodels (>=0.14.6,<0.15.0)",
     "scipy (>=1.18.0,<2.0.0)",
-    "dataframe-image (>=0.2.7,<0.3.0)"
+    "dataframe-image (>=0.2.7,<0.3.0)",
+    "scikit-learn (>=1.9.0,<2.0.0)",
+    "optuna (>=4.9.0,<5.0.0)",
+    "catboost (>=1.2.10,<2.0.0)"
 ]
 
 
