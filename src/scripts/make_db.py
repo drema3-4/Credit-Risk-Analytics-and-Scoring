@@ -2,7 +2,7 @@ import sqlite3
 import pandas as pd
 
 
-def make_raw_data_db() -> None:
+def make_db() -> None:
     dataset = pd.read_csv("data/raw/cs-training.csv")
     dataset = dataset.drop(columns=["Unnamed: 0"])
     
@@ -22,7 +22,7 @@ def make_raw_data_db() -> None:
 
     dataset["borrower_id"] = list(range(dataset.shape[0]))
 
-    conn = sqlite3.connect("sql_analysis/raw_data.db")
+    conn = sqlite3.connect("sql_analysis/db.db")
 
     dataset.to_sql(
         "borrowers",

@@ -1,10 +1,13 @@
 .venv/
 __pycache__/
 repo_dump.txt
-raw_data.db
+db.db
 temp.py
 temp.ipynb
 catboost_info/
 docs/risk_analysis/
 segmented_data/
 interim/
+scoring_data/
+docs/scoring/
+src/data/models_data/
