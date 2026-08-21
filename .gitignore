@@ -5,3 +5,6 @@ raw_data.db
 temp.py
 temp.ipynb
 catboost_info/
+docs/risk_analysis/
+segmented_data/
+interim/
