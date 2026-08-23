@@ -1,10 +1,13 @@
 import sqlite3
 import pandas as pd
+import numpy as np
 
 
 def make_db() -> None:
     dataset = pd.read_csv("data/raw/cs-training.csv")
     dataset = dataset.drop(columns=["Unnamed: 0"])
+
+    dataset["borrower_id"] = np.arange(1, dataset.shape[0] + 1)
     
     dataset = dataset.rename(columns={
         "SeriousDlqin2yrs": "target",
@@ -19,8 +22,6 @@ def make_db() -> None:
         "NumberOfTime60-89DaysPastDueNotWorse": "num_60_89_days_late",
         "NumberOfDependents": "num_dependents"
     })
-
-    dataset["borrower_id"] = list(range(dataset.shape[0]))
 
     conn = sqlite3.connect("sql_analysis/db.db")
 

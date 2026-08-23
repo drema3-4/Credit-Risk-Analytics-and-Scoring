@@ -90,8 +90,8 @@ def make_scoring_data() -> None:
     transformed_test_path = Path(f"{BASE_PATH}/transformed_test.csv")
     data_path = Path(f"{BASE_PATH}/data.csv")
 
-    train.to_csv(train_path)
-    test.to_csv(test_path)
-    transformed_train.to_csv(transformed_train_path)
-    transformed_test.to_csv(transformed_test_path)
-    data.to_csv(data_path)
+    train.to_csv(train_path, index=False)
+    test.to_csv(test_path, index=False)
+    transformed_train.to_csv(transformed_train_path, index=False)
+    transformed_test.to_csv(transformed_test_path, index=False)
+    data.to_csv(data_path, index=False)
