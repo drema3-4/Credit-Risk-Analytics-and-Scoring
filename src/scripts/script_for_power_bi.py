@@ -1,6 +1,11 @@
---------------------------------------------------------------
---08-1-- vw portfolio summary
---------------------------------------------------------------
+import sqlite3
+import pandas as pd
+
+db_path = "D:\Pet Projects\Analytics\Credit Risk Analytics & Scoring\src\sql_analysis\db.db"
+conn = sqlite3.connect(db_path)
+
+
+query_vw_portfolio_summary = """
 WITH borrowers_with_score AS (
 SELECT b.borrower_id, b.target, s.score
 FROM borrowers b
@@ -12,9 +17,9 @@ SELECT
     AVG(target) AS bad_rate,
     AVG(score) AS avg_pd
 FROM borrowers_with_score
---------------------------------------------------------------
---08-2-- vw risk segments
---------------------------------------------------------------
+"""
+
+query_vw_risk_segments = """
 WITH revolving_utilization_segments AS(
 SELECT
     CASE
@@ -330,9 +335,9 @@ FROM num_dependents_segments
 GROUP BY segment, severity_order
 ) AS t
 ORDER BY feature, severity_order;
---------------------------------------------------------------
---08-3-- vw risk grades
---------------------------------------------------------------
+"""
+
+query_vw_risk_grades = """
 WITH borrowers_with_deciles AS (
 SELECT *
 FROM borrowers b
@@ -377,9 +382,9 @@ SELECT
 FROM risk_segmented_borrowers
 GROUP BY risk_grade, pd_segment, severity_order
 ORDER BY severity_order;
---------------------------------------------------------------
---08-4-- vw score deciles
---------------------------------------------------------------
+"""
+
+query_vw_score_deciles = """
 WITH deciles AS (
 SELECT
     b.borrower_id,
@@ -404,9 +409,9 @@ SELECT
     ) AS cumulative_bads_share
 FROM deciles
 GROUP BY decile;
---------------------------------------------------------------
---08-5-- vw credit policy
---------------------------------------------------------------
+"""
+
+query_vw_credit_policy = """
 WITH cutoffs AS (
 SELECT 0 AS reject_pct
 UNION ALL SELECT 5
@@ -457,9 +462,9 @@ FROM scored s
 CROSS JOIN cutoffs c
 GROUP BY c.reject_pct
 ORDER BY c.reject_pct;
---------------------------------------------------------------
---08-6-- vw scored borrowers
---------------------------------------------------------------
+"""
+
+query_vw_scored_borrowers = """
 SELECT
     b.borrower_id,
     b.target,
@@ -475,3 +480,13 @@ SELECT
     b.num_dependents
 FROM borrowers b
 INNER JOIN borrowers_score s ON s.borrower_id = b.borrower_id;
+"""
+
+vw_portfolio_summary = pd.read_sql_query(query_vw_portfolio_summary, conn)
+vw_risk_segments = pd.read_sql_query(query_vw_risk_segments, conn)
+vw_risk_grades = pd.read_sql_query(query_vw_risk_grades, conn)
+vw_score_deciles = pd.read_sql_query(query_vw_score_deciles, conn)
+vw_credit_policy = pd.read_sql_query(query_vw_credit_policy, conn)
+vw_scored_borrowers = pd.read_sql_query(query_vw_scored_borrowers, conn)
+
+conn.close()
