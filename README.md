@@ -80,105 +80,107 @@
 [**Подробнее:** Scoring](https://github.com/drema3-4/Credit-Risk-Analytics-and-Scoring/tree/master/docs/Scoring.pdf)
 
 ### Credit Policy
-1. Cutoff-анализ показывает выраженный diminishing return при увеличении reject rate. Первые 5% наиболее рискованных заёмщиков концентрируют около 36.8% всех bad events. При увеличении reject rate до 10% bad capture возрастает до 56.2%, а при 15% — до 67.1%, при этом сохраняется соответственно 90% и 85% заёмщиков.
-2. После reject rate около 15% дополнительный эффект от дальнейшего ужесточения политики заметно снижается. Переход от 15% к 20% уменьшает approval volume ещё на 5 п.п., но увеличивает bad capture только примерно на 6.6 п.п. На последующих шагах marginal gain становится ещё ниже.
-3. Таким образом, диапазон reject rate 10–15% выглядит разумным статистическим trade-off между сохранением объёма одобрений и отсечением bad events. Однако без информации о доходности, кредитной экспозиции и стоимости кредитных потерь этот диапазон нельзя интерпретировать как экономически оптимальный cutoff.
+1. Cutoff-анализ показывает выраженный diminishing return при росте reject rate. Первые 5% наиболее рискованных заёмщиков концентрируют около **36,8%** всех bad events. При увеличении reject rate до 10% bad capture возрастает до **56,2%**, а при 15% - до **67,1%**; при этом в портфеле остаётся соответственно **90%** и **85%** заёмщиков.
+2. После reject rate около 15% дополнительный эффект от дальнейшего ужесточения политики заметно снижается. Переход от 15% к 20% уменьшает approval volume ещё на 5 п.п., но увеличивает bad capture только примерно на **6,6 п.п.** На следующих шагах marginal gain становится ещё ниже.
+3. Диапазон reject rate **10-15%** выглядит разумным статистическим trade-off между сохранением объёма одобрений и отсечением bad events. При этом без данных о доходности, кредитной экспозиции и стоимости кредитных потерь его нельзя интерпретировать как экономически оптимальный cutoff.
 
 [**Подробнее:** Credit Policy](https://github.com/drema3-4/Credit-Risk-Analytics-and-Scoring/tree/master/docs/Credit%20Policy.pdf)
 
-### SQl Analysis
-Весь проделанный анализ, от Data Overview и Data Quality до Credit Policy и Dashboard Views в некотором роде повторяется средствами SQL в файлах:
-1. 01_data_overview.sql - первичный обзор данных
-2. 02_data_quality.sql - анализ качества данных
-3. 03_delinquency_analysis.sql - связь просрочек с будущими серьёзными просрочками
-4. 04_risk_segments.sql - анализ сегментов риска
-5. 05_risk_concentration.sql - анализ сегнметов на пример наибольшей аккумуляции bad events
-6. 06_scoring_analysis.sql - анализ score segments
-7. 07_credit_policy - анализ cutoff сценариев
-8. 08_dashboard_views.sql - запросы для передачи данных в PowerBI
+### SQL Analysis
+Основные этапы анализа также воспроизведены средствами SQL: от первичного обзора и проверки качества данных до скоринга, cutoff-сценариев и подготовки витрин для Power BI.
 
-Данный набор запросов демонстрирует умение проводить анализ посредством SQL запросов.
+1. `01_data_overview.sql` - первичный обзор структуры, размера и полноты датасета.
+2. `02_data_quality.sql` - проверка дубликатов, пропусков, некорректных значений и специальных DPD-кодов.
+3. `03_delinquency_analysis.sql` - анализ связи прошлых просрочек с будущей серьёзной просрочкой.
+4. `04_risk_segments.sql` - расчёт метрик по отдельным risk-сегментам.
+5. `05_risk_concentration.sql` - оценка концентрации bad events в ключевых сегментах риска.
+6. `06_scoring_analysis.sql` - анализ score segments, risk grades и децилей скоринговой модели.
+7. `07_credit_policy.sql` - анализ cutoff-сценариев и их влияния на approval rate, approved bad rate и bad capture.
+8. `08_dashboard_views.sql` - запросы для формирования витрин, используемых в Power BI dashboard.
+
+Эти запросы показывают, как аналитические выводы проекта можно получить и проверить на уровне SQL-слоя.
 
 ### Dashboard
-Выполнена витрина данных, по корой можно проследить основные характеристики данных. Есть как исходный .pbix файл, так и [.pdf файл](https://github.com/drema3-4/Credit-Risk-Analytics-and-Scoring/tree/master/docs/Dashboard.pdf)
+Подготовлен Power BI dashboard для обзора портфеля, анализа risk-сегментов, скоринговых групп и credit policy сценариев. Витрина строится на SQL-запросах из `08_dashboard_views.sql`.
+
+В репозитории доступны исходный файл [`Dashboard.pbix`](https://github.com/drema3-4/Credit-Risk-Analytics-and-Scoring/tree/master/docs/Dashboard.pbix) и экспорт в формате [PDF](https://github.com/drema3-4/Credit-Risk-Analytics-and-Scoring/tree/master/docs/Dashboard.pdf).
 
 ---
 ## Быстрый старт
-Выполните следующий набор команд:
+Для запуска проекта нужен **Python 3.12.12** и установленный **Poetry**. Основной сценарий пересобирает аналитический датасет, SQLite-базу, модели и проектные артефакты.
 
 ```bash
-# Клонирование репозитория
 git clone https://github.com/drema3-4/Credit-Risk-Analytics-and-Scoring.git
-
-# Переход в папку проекта
 cd Credit-Risk-Analytics-and-Scoring
 
-# Установка зависимостей
 poetry install
 
-# Получение всех артефактов
 cd src
-python main.py
+poetry run python main.py
 ```
 
-После этого проект будет содержать все необходимые артефакты.
+После выполнения скрипта будут созданы или обновлены промежуточные датасеты, SQLite-база, обученные модели, метрики и графические артефакты для отчётов.
 
 ---
 ## Структура проекта
 
 ```bash
-/docs # Документация, отчёты и артефакты проекта
-    /credit_policy # артефакты credit policy анализа
-    /images # используемые картинки
-    /risk_analysis
-        /age # отчёт и график по feature risk segment analysis признака age
-        ...
-        /revolving_utilization # отчёт и график по feature risk segment analysis признака revolving_utilization
-        cross_segment_risk_analysis_summary.png # отчёт по pairwise risk segment analysis
-        risk_factor_summary.png # отчёт по risk segment analysis
-    /scoring
-        make_risk_ranking_decile_table.png # отчёт по децилям кредитного риска
-        models_metrics_vs.png # сравнение метрик качества базовой и продвинутой моделей
-        roc_aucs_logistic_regression_vs_catboost_classifier.png # ROC-AUC графики базовой и продвинутой моделей
-        top_logistic_regression_coefficients.png # график весов базовой модели для интерпретации её работы
-    Credit Policy.pdf # Credit Policy Analysis отчёт
-    Dashboard.pbix # PowerBI файл витрины данных
-    Dashboard.pdf # Витрина данных
-    Data Dictionary.pdf # Словарь признаков
-    Data Quality Analysis.pdf # Data Quality Analysis отчёт
-    Risk Analysis.pdf # Risk Analysis отчёт
-    Scoring.pdf # Scoring Analysis отчёт
-    Ключевые метрики.pdf # Ключевые метрики для Risk Analysis
-/src # код проекта
-    /data # данные и артефакты проекта
-        /interim # промежуточный вариант данных, полученный после Data Quality Analysis
-        /models_data # веса, гиперпараметры и метрики моделей
-        /raw # начальный вариант данных (сырые данные)
-        /scoring_data # данные, использующиеся для работы с моделями
-        /segmented_data # сегментированные данные по сегментам каждого признака
-    /notebooks # ноутбуки выполнения анализов
-    /scripts # Python скрипты для создания артефактов проекта
-    /sql_analysis # база данных и sql код анализов
-        ...
-        db.db # база данных sqlite3
-        test.ipynb # ноутбук для тестирования запросов к базе данных
-    /utils # вспомогательные функции, использующиеся для скриптов
-    main.py # файл вызова всех артефактов проекта
-.gitignore # файл git исключений
-poetry.lock # настройки окружения проекта
-pyproject.toml # настройки окружения проекта
-README.md
+.
+|-- docs/                         # отчёты, презентационные материалы и визуальные артефакты
+|   |-- credit_policy/            # таблицы и графики для credit policy анализа
+|   |-- images/                   # изображения, используемые в README и отчётах
+|   |-- risk_analysis/            # графики и таблицы по risk-сегментам
+|   |   |-- <feature>/            # отчёт и график по отдельному признаку
+|   |   |-- risk_factor_summary.png
+|   |   `-- cross_segment_risk_analysis_summary.png
+|   |-- scoring/                  # артефакты оценки качества моделей и risk ranking
+|   |-- Credit Policy.pdf
+|   |-- Dashboard.pbix
+|   |-- Dashboard.pdf
+|   |-- Data Dictionary.pdf
+|   |-- Data Quality Analysis.pdf
+|   |-- Risk Analysis.pdf
+|   |-- Scoring.pdf
+|   `-- Ключевые метрики.pdf
+|
+|-- src/                          # исходный код проекта
+|   |-- data/
+|   |   |-- raw/                  # исходный датасет
+|   |   |-- interim/              # данные после подготовки и data quality обработки
+|   |   |-- segmented_data/       # данные с risk-сегментами по признакам
+|   |   |-- scoring_data/         # train/test данные для скоринга
+|   |   `-- models_data/          # параметры, веса и метрики моделей
+|   |-- notebooks/                # ноутбуки с основными этапами анализа
+|   |-- scripts/                  # пайплайны подготовки данных, обучения и генерации артефактов
+|   |-- sql_analysis/             # SQL-запросы и SQLite-база для аналитического слоя
+|   |   |-- 01_data_overview.sql
+|   |   |-- 02_data_quality.sql
+|   |   |-- 03_delinquency_analysis.sql
+|   |   |-- 04_risk_segments.sql
+|   |   |-- 05_risk_concentration.sql
+|   |   |-- 06_scoring_analysis.sql
+|   |   |-- 07_credit_policy.sql
+|   |   |-- 08_dashboard_views.sql
+|   |   |-- db.db
+|   |   `-- test.ipynb
+|   |-- utils/                    # переиспользуемые функции для анализа, скоринга и credit policy
+|   `-- main.py                   # основной сценарий пересборки артефактов
+|
+|-- pyproject.toml                # зависимости и настройки Python-проекта
+|-- poetry.lock                   # зафиксированные версии зависимостей
+|-- .gitignore
+`-- README.md
 ```
 
 ---
 ## Используемые технологии
 1. **Python**
-    1. Numpy, Pandas
-    2. Matplotlip, Seaborn
-    4. StatsModels, Scipy
-    5. Sklearn, CatBoost, Optuna
-2. **Sqlite3**
-3. **PowerBI**
+    1. NumPy, Pandas
+    2. Matplotlib, Seaborn
+    3. Statsmodels, SciPy
+    4. Scikit-learn, CatBoost, Optuna
+2. **SQLite**
+3. **Power BI**
 
 ---
 ## Контакты
