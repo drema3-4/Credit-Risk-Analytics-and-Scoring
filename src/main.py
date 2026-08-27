@@ -38,6 +38,9 @@ from scripts.make_risk_ranking_decile_table import (
 from scripts.add_scoring_table_in_db import (
     add_scoring_table_in_db
 )
+from scripts.make_credit_policy_artefacts import (
+    make_credit_policy_artefacts
+)
 
 optuna.logging.disable_default_handler()
 warnings.filterwarnings("ignore")
@@ -70,6 +73,8 @@ def main() -> None:
     make_risk_ranking_decile_table()
     print("13. add scoring table in db")
     add_scoring_table_in_db()
+    print("14. make credit policy artefacts")
+    make_credit_policy_artefacts()
     
 if __name__ == "__main__":
     main()

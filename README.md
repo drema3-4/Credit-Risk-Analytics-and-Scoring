@@ -128,6 +128,7 @@ python main.py
 
 ```bash
 /docs # Документация, отчёты и артефакты проекта
+    /credit_policy # артефакты credit policy анализа
     /images # используемые картинки
     /risk_analysis
         /age # отчёт и график по feature risk segment analysis признака age
