@@ -59,7 +59,7 @@ def main() -> None:
     print("7. make scoring data")
     make_scoring_data()
     print("8. calc models best params")
-    # calc_models_best_params()
+    calc_models_best_params()
     print("9. train models")
     train_models()
     print("10. make catboost classifier vs logistic regression roc curves")
@@ -70,6 +70,6 @@ def main() -> None:
     make_risk_ranking_decile_table()
     print("13. add scoring table in db")
     add_scoring_table_in_db()
-
+    
 if __name__ == "__main__":
     main()
