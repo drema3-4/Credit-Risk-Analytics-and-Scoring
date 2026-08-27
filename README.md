@@ -47,7 +47,7 @@
 - Экстремальные значения `revolving_utilization` и `debt_ratio` требуют осторожной интерпретации: их распределение не полностью согласуется с буквальным смыслом показателей, а исходная документация не позволяет однозначно установить причину.
 - Пропуски в `monthly_income` связаны с экстремальными значениями `debt_ratio`, тогда как наблюдения с пропущенным `num_dependents` заметно отличаются от выборки в целом по ряду кредитных характеристик.
 
-Подробнее: docs/Data Quality Analysis.pdf
+[**Подробнее:** Data Quality Analysis](https://github.com/drema3-4/Credit-Risk-Analytics-and-Scoring/tree/master/docs/Data%20Quality%20Analysis.pdf)
 
 ### Risk Analysis
 - Наиболее выраженная связь с будущей серьёзной просрочкой наблюдается у **Revolving Utilization** и признаков **previous DPD** (`30–59`, `60–89`, `90+ DPD`).
@@ -58,7 +58,7 @@
 
 Обнаруженные зависимости следует интерпретировать как ассоциативные: датасет не содержит временной структуры, кредитных экспозиций, EAD/LGD и других данных, необходимых для полноценной оценки экономического эффекта и устойчивости выводов во времени.
 
-Подробнее: docs/Risk Analysis.pdf
+[**Подробнее:** Risk Analysis](https://github.com/drema3-4/Credit-Risk-Analytics-and-Scoring/tree/master/docs/Risk%20Analysis.pdf)
 
 ### Scoring
 Для ранжирования заёмщиков сравнивались интерпретируемая **Logistic Regression** и **CatBoost Classifier**.
@@ -77,4 +77,108 @@
 - Observed bad rate монотонно возрастает от **0,33% в D1** до **37,13% в D10**, что подтверждает способность модели разделять заёмщиков по уровню относительного риска.
 - Predicted risk систематически выше observed bad rate, поэтому выход CatBoost интерпретируется как **risk score для ранжирования**, а не как откалиброванная probability of default.
 
-Подробнее: docs/Scoring.pdf
+[**Подробнее:** Scoring](https://github.com/drema3-4/Credit-Risk-Analytics-and-Scoring/tree/master/docs/Scoring.pdf)
+
+### Credit Policy
+1. Cutoff-анализ показывает выраженный diminishing return при увеличении reject rate. Первые 5% наиболее рискованных заёмщиков концентрируют около 36.8% всех bad events. При увеличении reject rate до 10% bad capture возрастает до 56.2%, а при 15% — до 67.1%, при этом сохраняется соответственно 90% и 85% заёмщиков.
+2. После reject rate около 15% дополнительный эффект от дальнейшего ужесточения политики заметно снижается. Переход от 15% к 20% уменьшает approval volume ещё на 5 п.п., но увеличивает bad capture только примерно на 6.6 п.п. На последующих шагах marginal gain становится ещё ниже.
+3. Таким образом, диапазон reject rate 10–15% выглядит разумным статистическим trade-off между сохранением объёма одобрений и отсечением bad events. Однако без информации о доходности, кредитной экспозиции и стоимости кредитных потерь этот диапазон нельзя интерпретировать как экономически оптимальный cutoff.
+
+[**Подробнее:** Credit Policy](https://github.com/drema3-4/Credit-Risk-Analytics-and-Scoring/tree/master/docs/Credit%20Policy.pdf)
+
+### SQl Analysis
+Весь проделанный анализ, от Data Overview и Data Quality до Credit Policy и Dashboard Views в некотором роде повторяется средствами SQL в файлах:
+1. 01_data_overview.sql - первичный обзор данных
+2. 02_data_quality.sql - анализ качества данных
+3. 03_delinquency_analysis.sql - связь просрочек с будущими серьёзными просрочками
+4. 04_risk_segments.sql - анализ сегментов риска
+5. 05_risk_concentration.sql - анализ сегнметов на пример наибольшей аккумуляции bad events
+6. 06_scoring_analysis.sql - анализ score segments
+7. 07_credit_policy - анализ cutoff сценариев
+8. 08_dashboard_views.sql - запросы для передачи данных в PowerBI
+
+Данный набор запросов демонстрирует умение проводить анализ посредством SQL запросов.
+
+### Dashboard
+Выполнена витрина данных, по корой можно проследить основные характеристики данных. Есть как исходный .pbix файл, так и [.pdf файл](https://github.com/drema3-4/Credit-Risk-Analytics-and-Scoring/tree/master/docs/Dashboard.pdf)
+
+---
+## Быстрый старт
+Выполните следующий набор команд:
+
+```bash
+# Клонирование репозитория
+git clone https://github.com/drema3-4/Credit-Risk-Analytics-and-Scoring.git
+
+# Переход в папку проекта
+cd Credit-Risk-Analytics-and-Scoring
+
+# Установка зависимостей
+poetry install
+
+# Получение всех артефактов
+cd src
+python main.py
+```
+
+После этого проект будет содержать все необходимые артефакты.
+
+---
+## Структура проекта
+
+```bash
+/docs # Документация, отчёты и артефакты проекта
+    /images # используемые картинки
+    /risk_analysis
+        /age # отчёт и график по feature risk segment analysis признака age
+        ...
+        /revolving_utilization # отчёт и график по feature risk segment analysis признака revolving_utilization
+        cross_segment_risk_analysis_summary.png # отчёт по pairwise risk segment analysis
+        risk_factor_summary.png # отчёт по risk segment analysis
+    /scoring
+        make_risk_ranking_decile_table.png # отчёт по децилям кредитного риска
+        models_metrics_vs.png # сравнение метрик качества базовой и продвинутой моделей
+        roc_aucs_logistic_regression_vs_catboost_classifier.png # ROC-AUC графики базовой и продвинутой моделей
+        top_logistic_regression_coefficients.png # график весов базовой модели для интерпретации её работы
+    Credit Policy.pdf # Credit Policy Analysis отчёт
+    Dashboard.pbix # PowerBI файл витрины данных
+    Dashboard.pdf # Витрина данных
+    Data Dictionary.pdf # Словарь признаков
+    Data Quality Analysis.pdf # Data Quality Analysis отчёт
+    Risk Analysis.pdf # Risk Analysis отчёт
+    Scoring.pdf # Scoring Analysis отчёт
+    Ключевые метрики.pdf # Ключевые метрики для Risk Analysis
+/src # код проекта
+    /data # данные и артефакты проекта
+        /interim # промежуточный вариант данных, полученный после Data Quality Analysis
+        /models_data # веса, гиперпараметры и метрики моделей
+        /raw # начальный вариант данных (сырые данные)
+        /scoring_data # данные, использующиеся для работы с моделями
+        /segmented_data # сегментированные данные по сегментам каждого признака
+    /notebooks # ноутбуки выполнения анализов
+    /scripts # Python скрипты для создания артефактов проекта
+    /sql_analysis # база данных и sql код анализов
+        ...
+        db.db # база данных sqlite3
+        test.ipynb # ноутбук для тестирования запросов к базе данных
+    /utils # вспомогательные функции, использующиеся для скриптов
+    main.py # файл вызова всех артефактов проекта
+.gitignore # файл git исключений
+poetry.lock # настройки окружения проекта
+pyproject.toml # настройки окружения проекта
+README.md
+```
+
+---
+## Используемые технологии
+1. **Python**
+    1. Numpy, Pandas
+    2. Matplotlip, Seaborn
+    4. StatsModels, Scipy
+    5. Sklearn, CatBoost, Optuna
+2. **Sqlite3**
+3. **PowerBI**
+
+---
+## Контакты
+Я нахожусь в активном поиске работы в сфере **аналитики данных** или **ML**, поэтому, если вас заинтересует мой проект пишите мне по адресу **drema3-4@yandex.ru** с темой **Работа**.
