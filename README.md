@@ -11,6 +11,10 @@
 4. Как меняется portfolio bad rate при различных cutoff?
 
 ---
+## Источник данных
+В проекте используется датасет [**Give Me Some Credit**](https://www.kaggle.com/competitions/give-me-some-credit/data) с Kaggle. Лицензия / условия использования на странице датасета указаны как **Subject to Competition Rules**; данные используются в учебно-аналитических целях.
+
+---
 ## Словарь данных
 
 | Признак               | Описание                                                                                                                                                         | Тип     | Роль    |

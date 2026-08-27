@@ -77,9 +77,9 @@ def make_scoring_data() -> None:
         special_valuess=SPECIAL_VALUES
     )
 
-    train.fillna(-1)
-    test.fillna(-1)
-    data.fillna(-1)
+    train = train.fillna(-1)
+    test = test.fillna(-1)
+    data = data.fillna(-1)
 
     path = Path(BASE_PATH + "/")
     path.mkdir(parents=True, exist_ok=True)

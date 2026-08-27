@@ -63,6 +63,6 @@ def plot_price_and_effect_of_the_policy(
 
     plt.tight_layout()
 
-    out_path = Path("../docs/credit_policy/plot_approved_borrowers_and_bads.png")
+    out_path = Path("../docs/credit_policy/plot_price_and_effect_of_the_policy.png")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path)
